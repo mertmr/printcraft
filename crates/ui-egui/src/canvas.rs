@@ -1244,6 +1244,7 @@ pub fn document_area(app: &mut PrintCraftApp, index: usize, ui: &mut egui::Ui) {
             let vid = view.id;
             let on_flat = tool == QuickTool::Select
                 && !preparing
+                && !editing_content
                 && crate::forms_ui::flat_page_input(ui, &resp, &xf, i, info, &form, view, allowed, &author, doc.edit_generation(), &|page| {
                     app.session
                         .detect_fields(vid, &[page])

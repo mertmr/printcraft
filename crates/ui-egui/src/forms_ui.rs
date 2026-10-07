@@ -365,6 +365,10 @@ pub(crate) fn flat_page_input(
     generation: u64,
     detect: &dyn Fn(usize) -> Vec<[f64; 4]>,
 ) -> bool {
+    // A printed square must not take over a drag or swallow its release.
+    if view.comments.gesture.is_some() || resp.dragged() || resp.drag_stopped() {
+        return false;
+    }
     if generation != view.forms.flat_gen {
         view.forms.flat.clear();
         view.forms.flat_gen = generation;

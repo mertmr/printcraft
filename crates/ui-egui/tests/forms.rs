@@ -262,3 +262,77 @@ fn printed_square_commits_the_active_text_draft() {
     h.run_steps(2);
     assert!(value(&h, "name").is_empty(), "the preceding step committed the text");
 }
+
+#[test]
+fn selecting_added_content_over_a_printed_square_does_not_toggle_checks() {
+    use printcraft_engine::{AddedText, Edit};
+    let mut h = printed_form();
+    assert!(
+        h.state_mut()
+            .apply_edit(Edit::AddText { page: 0, text: AddedText { rect: [24.0, 18.0, 65.0, 36.0], text: "Text".into(), ..Default::default() } })
+    );
+    h.state_mut().set_option("tool", "edit").unwrap();
+    h.run_steps(4);
+    click_square(&mut h);
+    let s = h.state();
+    assert_eq!(s.views[0].content.selected, Some((0, 0)), "the added text is selected");
+    assert!(!s.session.get(s.views[0].id).unwrap().info.annotations.iter().any(|a| a.stamp.as_deref() == Some("PCCheck")));
+
+    // Selecting the same text must also leave a previously placed check alone.
+    h.state_mut().set_option("left", "closed").unwrap();
+    h.run_steps(3);
+    click_square(&mut h);
+    h.state_mut().set_option("tool", "edit").unwrap();
+    h.run_steps(3);
+    click_square(&mut h);
+    let s = h.state();
+    assert_eq!(s.views[0].content.selected, Some((0, 0)));
+    assert!(s.session.get(s.views[0].id).unwrap().info.annotations.iter().any(|a| a.stamp.as_deref() == Some("PCCheck")));
+}
+
+#[test]
+fn dropping_a_comment_on_a_printed_square_finishes_the_move() {
+    use printcraft_engine::{Edit, NewAnnotation, Shape, Style};
+    let mut h = printed_form();
+    let start_rect = [80.0, 18.0, 98.0, 36.0];
+    let shape = Shape::Rectangle { rect: start_rect };
+    let style = Style::default_for(&shape);
+    assert!(h.state_mut().apply_edit(Edit::AddAnnotation(NewAnnotation {
+        page: 0,
+        shape,
+        style,
+        contents: "Move me".into(),
+        author: "Tester".into()
+    })));
+    h.run_steps(3);
+    let (start, end) = {
+        let s = h.state();
+        let doc = s.session.get(s.views[0].id).unwrap();
+        (
+            printcraft_ui_egui::forms_ui::square_screen_rect(&s.views[0], &doc.info, 0, start_rect).unwrap().center(),
+            printcraft_ui_egui::forms_ui::square_screen_rect(&s.views[0], &doc.info, 0, PRINTED_SQUARE).unwrap().center(),
+        )
+    };
+    h.hover_at(start);
+    h.run_steps(2);
+    h.drag_at(start);
+    h.run_steps(1);
+    h.hover_at(start + egui::vec2(-12.0, 0.0));
+    h.run_steps(2);
+    assert!(h.state().views[0].comments.gesture.is_some(), "the move started");
+    h.hover_at(end);
+    h.run_steps(2);
+    h.drop_at(end);
+    h.run_steps(4);
+    let s = h.state();
+    assert!(s.views[0].comments.gesture.is_none(), "the drop finished the move");
+    let annotations = &s.session.get(s.views[0].id).unwrap().info.annotations;
+    assert_eq!(annotations.len(), 1, "the drag did not add a check");
+    for (actual, expected) in annotations[0].rect.into_iter().zip(PRINTED_SQUARE) {
+        assert!((f64::from(actual) - expected).abs() < 0.001, "the comment moved onto the square");
+    }
+    h.state_mut().undo();
+    h.run_steps(2);
+    let s = h.state();
+    assert_eq!(s.session.get(s.views[0].id).unwrap().info.annotations[0].rect, start_rect.map(|v| v as f32));
+}
