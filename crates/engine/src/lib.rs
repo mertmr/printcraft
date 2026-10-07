@@ -1572,6 +1572,7 @@ fn comment_list(doc: &printcraft_cos::Document) -> Vec<printcraft_render::Annota
             quads: s.quads,
             locked: s.locked,
             intent: s.intent,
+            stamp: s.stamp,
         })
         .collect()
 }
