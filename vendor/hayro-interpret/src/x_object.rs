@@ -53,7 +53,8 @@ impl<'a> XObject<'a> {
 }
 
 pub(crate) struct FormXObject<'a> {
-    pub(crate) decoded: Cow<'a, [u8]>,
+    // PdfCraft patch: counted against the page's content budget while the form is alive.
+    pub(crate) decoded: crate::context::DecodedContent<'a>,
     pub(crate) matrix: Affine,
     pub(crate) bbox: [f32; 4],
     is_transparency_group: bool,
@@ -65,7 +66,8 @@ impl<'a> FormXObject<'a> {
     pub(crate) fn new(stream: &Stream<'a>) -> Option<Self> {
         let dict = stream.dict();
 
-        let decoded = stream.decoded().ok()?;
+        // PdfCraft patch: see `context::MAX_PAGE_CONTENT`.
+        let decoded = crate::context::decode_content(stream)?;
         let resources = dict.get::<Dict<'_>>(RESOURCES).unwrap_or_default();
 
         let matrix = Affine::new(
@@ -399,7 +401,7 @@ fn decode_context<'a>(
     obj: &ImageXObject<'a>,
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodeContext<'a>> {
-    // PrintCraft patch: images and masks over `MAX_IMAGE_PIXELS` are not decoded at all (the
+    // PdfCraft patch: images and masks over `MAX_IMAGE_PIXELS` are not decoded at all (the
     // renderer skips them anyway): a fuzzed `/W 4294967295` stencil mask allocated gigabytes here.
     if !image_size_ok(obj.width, obj.height) {
         (obj.warning_sink)(InterpreterWarning::ImageDecodeFailure);
@@ -975,7 +977,7 @@ fn apply_decode_array(
     Some(decoded_arr)
 }
 
-/// PrintCraft patch: whether an image or mask of `width` × `height` may be decoded (at most
+/// PdfCraft patch: whether an image or mask of `width` × `height` may be decoded (at most
 /// 2^28 pixels, the renderer's `MAX_IMAGE_PIXELS`).
 pub fn image_size_ok(width: u32, height: u32) -> bool {
     width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 1 << 28

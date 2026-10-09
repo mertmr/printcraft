@@ -24,10 +24,19 @@ use crate::reader::Reader;
 
 const MAX_SYMBOLS: u32 = u16::MAX as u32;
 
-/// PrintCraft patch: the most symbol pixels one dictionary may decode (2^26). Symbols are
+/// PdfCraft patch: the most symbol pixels one dictionary may decode (2^26). Symbols are
 /// decoded pixel by pixel, and up to 65535 of them of up to 65535 × 65535 each kept a fuzzed
 /// file decoding for minutes; real dictionaries hold about a million pixels.
 const MAX_DICTIONARY_PIXELS: u64 = 1 << 26;
+
+/// PdfCraft patch: decoding steps that decode nothing, allowed beyond what a valid dictionary can
+/// need. A height class without a symbol and an export run of length 0 don't move their loops
+/// on, and past the end of its data the arithmetic decoder can decode them for ever: one changed
+/// byte in a symbol dictionary hung the renderer. A valid dictionary needs at most one height
+/// class per new symbol, and `2 × symbols + 1` export runs (they alternate between exported and
+/// not, so at most one zero-length run before each symbol's). Encoders don't write empty steps
+/// back to back; this tolerates a thousand.
+const EXTRA_EMPTY_STEPS: u64 = 1024;
 
 /// Decode a symbol dictionary segment (7.4.2, 6.5).
 pub(crate) fn decode(
@@ -79,7 +88,14 @@ pub(crate) fn decode(
         }
     };
 
+    // PdfCraft patch: see `EXTRA_EMPTY_STEPS`.
+    let mut height_classes_left = u64::from(num_new_symbols) + EXTRA_EMPTY_STEPS;
+
     while ctx.symbols_decoded_count < num_new_symbols {
+        if height_classes_left == 0 {
+            bail!(SymbolError::Invalid);
+        }
+        height_classes_left -= 1;
         let height_class_delta =
             read_height_class_delta(&mut ctx)?.ok_or(SymbolError::UnexpectedOob)?;
 
@@ -107,7 +123,7 @@ pub(crate) fn decode(
                 .total_width
                 .checked_add(symbol_width)
                 .ok_or(OverflowError::BitmapDimension)?;
-            // PrintCraft patch: see `MAX_DICTIONARY_PIXELS`.
+            // PdfCraft patch: see `MAX_DICTIONARY_PIXELS`.
             ctx.pixels = ctx
                 .pixels
                 .saturating_add(u64::from(symbol_width) * u64::from(ctx.height_class_height));
@@ -447,7 +463,7 @@ struct SymbolDecodeContext<'a> {
     symbols_decoded_count: u32,
     total_width: u32,
     height_class_height: u32,
-    /// PrintCraft patch: symbol pixels decoded so far (see `MAX_DICTIONARY_PIXELS`).
+    /// PdfCraft patch: symbol pixels decoded so far (see `MAX_DICTIONARY_PIXELS`).
     pixels: u64,
 }
 
@@ -694,8 +710,14 @@ fn export_symbols(ctx: &mut SymbolDecodeContext<'_>) -> Result<Vec<Bitmap>> {
     let mut exported = Vec::with_capacity(ctx.header.num_exported_symbols as usize);
     let mut index: u32 = 0;
     let mut should_export = false;
+    // PdfCraft patch: see `EXTRA_EMPTY_STEPS`.
+    let mut runs_left = u64::from(total_symbols) * 2 + 1 + EXTRA_EMPTY_STEPS;
 
     while index < total_symbols {
+        if runs_left == 0 {
+            bail!(SymbolError::Invalid);
+        }
+        runs_left -= 1;
         let run_length = read_run_length()?;
 
         let end_index = index.checked_add(run_length).ok_or(OverflowError::Index)?;

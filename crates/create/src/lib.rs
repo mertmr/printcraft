@@ -1,12 +1,12 @@
-//! printcraft-create — create PDFs from nothing, images or text (L4). See the README.
+//! pdfcraft-create — create PDFs from nothing, images or text (L4). See the README.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use printcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
+use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
 
 mod extract;
 pub use extract::{ExtractedImage, ImageExport, extract_images, image_file};
-use printcraft_fonts::{literal, win_ansi, wrap};
+use pdfcraft_fonts::{literal, win_ansi, wrap};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum CreateError {
@@ -50,7 +50,7 @@ fn add_page(doc: &mut Document, w: f64, h: f64, resources: Dict, content: Option
 fn set_title(doc: &mut Document, title: &str) {
     let mut info = Dict::new();
     info.set(b"Title".to_vec(), PdfString::text(title));
-    info.set(b"Producer".to_vec(), PdfString::text("PrintCraft"));
+    info.set(b"Producer".to_vec(), PdfString::text("PdfCraft"));
     let r = doc.add(info);
     doc.trailer_mut().set(b"Info".to_vec(), Object::Ref(r));
 }
@@ -374,6 +374,45 @@ fn tiff_pages(name: &str, bytes: &[u8]) -> Result<Vec<Embedded>, CreateError> {
     Ok(out)
 }
 
+/// What a file picked for Create is, by its bytes (and, for text, its name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    Pdf,
+    Image,
+    Text,
+}
+
+/// File extensions Create converts to PDF (images and plain text).
+pub const CONVERTIBLE: [&str; 12] = ["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp", "jp2", "j2k", "jpx", "txt", "text"];
+
+fn is_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8])
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"II*\0")
+        || bytes.starts_with(b"MM\0*")
+        || bytes.starts_with(b"GIF8")
+        // JPEG 2000: a JP2 file or a raw codestream.
+        || bytes.starts_with(JP2_SIGNATURE)
+        || bytes.starts_with(&[0xFF, 0x4F, 0xFF, 0x51])
+        // BMP: "BM" and a known header size (so text starting with "BM" stays text).
+        || (bytes.starts_with(b"BM")
+            && bytes.get(14..18).and_then(|h| <[u8; 4]>::try_from(h).ok()).is_some_and(|h| matches!(u32::from_le_bytes(h), 12 | 40 | 52 | 56 | 108 | 124)))
+}
+
+/// Whether `bytes` named `name` is a PDF, an image Create can embed, or plain text (a `.txt` or
+/// `.text` file). `None` for anything else.
+pub fn source_kind(name: &str, bytes: &[u8]) -> Option<SourceKind> {
+    let head = bytes.get(..bytes.len().min(1024)).unwrap_or_default();
+    if head.windows(5).any(|w| w == b"%PDF-") {
+        return Some(SourceKind::Pdf);
+    }
+    if is_image(bytes) {
+        return Some(SourceKind::Image);
+    }
+    let lower = name.to_ascii_lowercase();
+    (lower.ends_with(".txt") || lower.ends_with(".text")).then_some(SourceKind::Text)
+}
+
 /// Detect the image format from its bytes; a TIFF may hold several pages.
 fn embed(name: &str, bytes: &[u8]) -> Result<Vec<Embedded>, CreateError> {
     if bytes.starts_with(&[0xFF, 0xD8]) {
@@ -411,14 +450,38 @@ pub fn image_xobject(doc: &mut Document, name: &str, bytes: &[u8]) -> Result<(Ob
     Ok((doc.add(Object::Stream(stream)), size))
 }
 
+/// Resolution used to size PDF pages. Image pixels are never resampled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ImageResolution {
+    /// Embedded resolution, falling back to 72 dpi when absent.
+    #[default]
+    Embedded,
+    /// Override both axes with a finite resolution between 1 and 1200 dpi.
+    Dpi(f64),
+}
+
 /// One page per image, each the size of its image at the image's resolution.
 pub fn from_images(images: &[(String, Vec<u8>)]) -> Result<Document, CreateError> {
+    from_images_with_resolution(images, ImageResolution::Embedded)
+}
+
+/// Create image pages with embedded resolution or a fixed dpi (72 gives one point per pixel).
+pub fn from_images_with_resolution(images: &[(String, Vec<u8>)], resolution: ImageResolution) -> Result<Document, CreateError> {
+    if let ImageResolution::Dpi(dpi) = resolution
+        && (!dpi.is_finite() || !(1.0..=1200.0).contains(&dpi))
+    {
+        return Err(CreateError::Invalid("image DPI must be finite and between 1 and 1200".into()));
+    }
     if images.is_empty() {
         return Err(CreateError::Invalid("no images".into()));
     }
     let mut doc = Document::new_empty();
     for img in images.iter().map(|(name, bytes)| embed(name, bytes)).collect::<Result<Vec<_>, _>>()?.into_iter().flatten() {
-        let (mut w, mut h) = (img.px.0 as f64 * 72.0 / img.dpi.0, img.px.1 as f64 * 72.0 / img.dpi.1);
+        let dpi = match resolution {
+            ImageResolution::Embedded => img.dpi,
+            ImageResolution::Dpi(dpi) => (dpi, dpi),
+        };
+        let (mut w, mut h) = (img.px.0 as f64 * 72.0 / dpi.0, img.px.1 as f64 * 72.0 / dpi.1);
         // Keep huge images within the largest page PDF allows.
         let k = (MAX_SIDE / w.max(h)).min(1.0);
         w *= k;

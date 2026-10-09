@@ -21,8 +21,78 @@ use vello_cpu::{
 };
 
 
-/// PrintCraft patch: largest image drawn, in pixels (2^28 ≈ 268 MP, well above real page images).
+/// PdfCraft patch: largest image drawn, in pixels (2^28 ≈ 268 MP, well above real page images).
 const MAX_IMAGE_PIXELS: u64 = 1 << 28;
+
+/// PdfCraft patch: most pieces one dashed stroke may be cut into. Stroke expansion keeps every
+/// dash, so a pattern that is tiny next to its path asks for billions: a fuzzed `/D [[11] 0]` on
+/// a line from x = 92234775807 allocated over 5 GB, and `[0.000001] 0 d` on a 20 pt line over
+/// 10 GB. Measured in release builds: a stroke cut into 250,000 pieces renders in about 16 ms and
+/// 75 MB at its peak (a million took 80 ms and 290 MB). Dotted and dashed lines in real documents
+/// stay far below this.
+const MAX_DASHES_PER_STROKE: f64 = 250_000.0;
+
+/// PdfCraft patch: the dash pattern to stroke `path` with. Empty (a solid line) when the pattern
+/// is invalid, or when it could cut the path into more than [`MAX_DASHES_PER_STROKE`] pieces.
+/// ISO 32000-2 §8.4.3.6 requires nonnegative entries that are not all zero; a pattern whose
+/// period isn't positive (`[-1 -1] 0 d`) made kurbo's search for the starting dash loop for ever.
+fn usable_dash_pattern(path: &BezPath, dashes: &[f32]) -> Vec<f64> {
+    if dashes.iter().any(|d| !d.is_finite() || *d < 0.0) {
+        return Vec::new();
+    }
+    let sum: f64 = dashes.iter().map(|d| f64::from(*d)).sum();
+    // kurbo repeats an odd-length pattern once, as SVG does, so a period covers it twice.
+    let (period, per_period) = if dashes.len() % 2 == 1 {
+        (2.0 * sum, dashes.len().saturating_mul(2))
+    } else {
+        (sum, dashes.len())
+    };
+    if !period.is_finite() || period <= 0.0 {
+        return Vec::new();
+    }
+    let (length, restarts) = control_polygon_length(path);
+    // kurbo restarts the pattern at every subpath and after every `ClosePath`, so each restart
+    // can begin up to a whole period of pieces however short its segment is.
+    let pieces = (length / period + restarts as f64) * per_period as f64;
+    if !pieces.is_finite() || pieces > MAX_DASHES_PER_STROKE {
+        return Vec::new();
+    }
+    dashes.iter().map(|d| f64::from(*d)).collect()
+}
+
+/// PdfCraft patch: the length of `path`'s control polygon, which a curve never exceeds, and how
+/// many times kurbo restarts a dash pattern along it (each `MoveTo` and `ClosePath`).
+fn control_polygon_length(path: &BezPath) -> (f64, usize) {
+    let (mut length, mut restarts) = (0.0, 0usize);
+    let (mut start, mut last) = (Point::ORIGIN, Point::ORIGIN);
+    for el in path.elements() {
+        match *el {
+            kurbo::PathEl::MoveTo(p) => {
+                (start, last) = (p, p);
+                restarts = restarts.saturating_add(1);
+            }
+            kurbo::PathEl::LineTo(p) => {
+                length += last.distance(p);
+                last = p;
+            }
+            kurbo::PathEl::QuadTo(c, p) => {
+                length += last.distance(c) + c.distance(p);
+                last = p;
+            }
+            kurbo::PathEl::CurveTo(c1, c2, p) => {
+                length += last.distance(c1) + c1.distance(c2) + c2.distance(p);
+                last = p;
+            }
+            kurbo::PathEl::ClosePath => {
+                length += last.distance(start);
+                last = start;
+                restarts = restarts.saturating_add(1);
+            }
+        }
+    }
+    (length, restarts)
+}
+
 pub(crate) struct Renderer {
     pub(crate) ctx: RenderContext,
     pub(crate) inside_pattern: bool,
@@ -61,7 +131,7 @@ impl Renderer {
         }
     }
 
-    fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool) {
+    fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool, path: &BezPath) {
         let threshold = if is_text { 0.25 } else { 1.0 };
 
         // Best-effort attempt to ensure a line width of at least 1.0, as required by the PDF
@@ -77,7 +147,7 @@ impl Renderer {
             line_width *= threshold;
         }
 
-        // PrintCraft patch: a stroke far wider than the canvas looks the same as one a few canvases
+        // PdfCraft patch: a stroke far wider than the canvas looks the same as one a few canvases
         // wide, but its geometry grows with the width: a fuzzed `/LW 9223372036854775807`
         // allocated 10 GB in stroke expansion.
         let widest = 4.0 * (f32::from(self.ctx.width()) + f32::from(self.ctx.height()));
@@ -91,8 +161,13 @@ impl Renderer {
             miter_limit: stroke_props.miter_limit as f64,
             start_cap: stroke_props.line_cap,
             end_cap: stroke_props.line_cap,
-            dash_pattern: stroke_props.dash_array.iter().map(|n| *n as f64).collect(),
-            dash_offset: stroke_props.dash_offset as f64,
+            // PdfCraft patch: see `usable_dash_pattern`.
+            dash_pattern: usable_dash_pattern(path, &stroke_props.dash_array).into(),
+            dash_offset: if stroke_props.dash_offset.is_finite() {
+                stroke_props.dash_offset as f64
+            } else {
+                0.0
+            },
         };
 
         self.ctx.set_stroke(stroke);
@@ -224,7 +299,7 @@ impl Renderer {
         };
         let mut img_width = image_data.width();
         let mut img_height = image_data.height();
-        // PrintCraft patch: skip images with absurd dimensions (a fuzzed inline image claimed
+        // PdfCraft patch: skip images with absurd dimensions (a fuzzed inline image claimed
         // /W 4294967295 over four bytes of data; resampling it never finished).
         if img_width == 0 || img_height == 0 || u64::from(img_width) * u64::from(img_height) > MAX_IMAGE_PIXELS {
             return;
@@ -474,7 +549,9 @@ impl Renderer {
                             self.ctx.height() as f64,
                         ));
 
-                        let encoded = s.encode();
+                        // PdfCraft patch: mesh shadings are sampled only inside `bbox` (and a
+                        // pixel around it: texels at a fractional edge look one pixel further).
+                        let encoded = s.encode_within(Some(bbox.inflate(1.0, 1.0)));
                         let (image, width, height, transform, may_have_transparency) =
                             render_shading_texture(bbox, &encoded);
                         let may_have_transparency =
@@ -518,7 +595,7 @@ impl Renderer {
                         };
                         xs = xs.max(min_x_scale).min(max_x_scale);
                         ys = ys.max(min_y_scale).min(max_y_scale);
-                        // PrintCraft patch: the cell pixmap is `step × scale` pixels, which only the
+                        // PdfCraft patch: the cell pixmap is `step × scale` pixels, which only the
                         // u16 cast below bounded (a fuzzed /XStep far beyond /BBox gave 65535² cells).
                         xs = tiling_cell_scale(xs, t.x_step, MAX_PIXMAP_SIZE);
                         ys = tiling_cell_scale(ys, t.y_step, MAX_PIXMAP_SIZE);
@@ -598,7 +675,7 @@ impl Renderer {
         is_text: bool,
     ) {
         self.ctx.set_transform(transform);
-        self.set_stroke_properties(stroke_props, is_text);
+        self.set_stroke_properties(stroke_props, is_text, path);
 
         let clip_path = self.set_paint(paint, path, true);
         if let Some(clip_path) = clip_path.as_ref() {
@@ -1160,7 +1237,7 @@ fn convert_blend_mode(blend_mode: BlendMode) -> peniko::BlendMode {
     peniko::BlendMode::new(mix, Compose::SrcOver)
 }
 
-/// PrintCraft patch: the scale for a tiling cell, lowered so that the cell pixmap (`|step| ×
+/// PdfCraft patch: the scale for a tiling cell, lowered so that the cell pixmap (`|step| ×
 /// scale` pixels a side) stays within `max_pixels`. Geometry is unchanged (the pattern transform
 /// is derived from the scale); an over-large step only renders at lower resolution.
 pub fn tiling_cell_scale(scale: f32, step: f32, max_pixels: f32) -> f32 {

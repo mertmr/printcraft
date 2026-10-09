@@ -1,4 +1,4 @@
-# printcraft-sign
+# pdfcraft-sign
 
 Layer L4: digital signatures (execution plan M9; ISO 32000-2 §12.8; PAdES, ETSI EN 319 142).
 
@@ -23,14 +23,36 @@ for s in signatures(&doc, &bytes, &trust) {                                // li
   or invisible); certification with DocMDP P=1/2/3. The document is written incrementally
   with a zero-filled `/Contents` and fixed-width `/ByteRange`, which are then patched in
   place. Encrypted documents are refused for now.
+- **Timestamps (PAdES B-T):** the `timestamp` module builds and parses RFC 3161 requests,
+  responses and TSTInfo tokens (size-capped, imprint- and signature-checked). `sign_with_timestamp`
+  attaches the TSA's token as an unsigned attribute over the signature value; the transport is
+  the caller's (`TimestampAuthority` — this crate never opens a socket). Validation verifies
+  embedded tokens; when the TSA chains to the trust store it reports the trusted time in
+  `SignatureInfo::timestamp_time`, which then anchors certificate-validity and revocation
+  checks. An untrusted TSA's time is reported as an unverified timestamp and never used as the
+  validation time (the signer's claimed time is). `timestamp::respond` is the TSA-side signer behind the
+  deterministic test authority.
+- **Document timestamps and LTV:** `timestamp_document` appends a standalone RFC 3161
+  document timestamp (`/ETSI.RFC3161`) covering the whole file; validation discovers and
+  verifies these dictionaries (imprint over the signed bytes, token signature, TSA cert
+  validity). `dss::embed` merges revocation evidence into the catalog's `/DSS` with `/VRI`
+  entries keyed per signature (uppercase-hex SHA-1 of `/Contents`), deduplicating
+  byte-identical blobs — sign → DSS → timestamp makes a B-LTA file, and the change classifier
+  treats the store as a permitted change. `revocation` parses and verifies RFC 5280 CRLs and
+  RFC 6960 OCSP responses (responder identity, OCSP-signing EKU for delegated responders,
+  CertID hash matching, validity windows); validation checks embedded evidence against the
+  signer's chain and a verified revocation invalidates the signature.
+
+Not yet: revocation fetching (AIA/CRLDP extraction and a fetcher), timestamp-server
+configuration, FieldMDP locks, certificate security, smart cards and PKCS #11 tokens.
+macOS Keychain and Windows Current User Personal (My) store identities sign through
+`ExternalKey` without exporting private keys. Windows CNG supports RSA PKCS #1 v1.5 and
+ECDSA P-256/P-384; the store integration is tested with software-backed keys.
 - **Validation:** `/ByteRange` and the CMS are read from the file's own bytes; the digest,
   the signature value and the signer's chain (against a `TrustStore`) are checked. Later
   revisions are diffed against the signed one, and the changes are classified (signing, form
   fill, comments, metadata, page content, document structure) under the DocMDP permissions.
   The verdict follows Acrobat: valid, unknown (intact but the identity isn't trusted) or invalid.
-
-Not yet: RFC 3161 timestamps, LTV (DSS/VRI, OCSP, CRL), FieldMDP locks, certificate security,
-OS key stores and PKCS #11 tokens.
 
 Oracles: poppler's `pdfsig` reports our signatures valid; OpenSSL reads our `.p12` files and
 verifies our CMS; `tests/data/openssl-signed.pdf` is a signature OpenSSL made, which we validate.

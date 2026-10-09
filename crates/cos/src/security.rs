@@ -1,4 +1,4 @@
-//! Bridging the COS object model and `printcraft-crypt`: reading `/Encrypt` dictionaries and
+//! Bridging the COS object model and `pdfcraft-crypt`: reading `/Encrypt` dictionaries and
 //! decrypting / encrypting the strings and streams of an object (§7.6.2).
 //!
 //! Not encrypted, per the spec: the `/Encrypt` dictionary itself, cross-reference streams, the
@@ -6,7 +6,7 @@
 //! metadata streams when `/EncryptMetadata` is false. Streams naming a crypt filter (`/Crypt` in
 //! `/Filter`) use that filter; embedded files use `/EFF`.
 
-use printcraft_crypt::{EncryptDict, Method, SecurityHandler, StreamKind};
+use pdfcraft_crypt::{EncryptDict, Method, SecurityHandler, StreamKind};
 
 use crate::{Dict, Document, Object, PdfString, Stream};
 
@@ -108,7 +108,7 @@ fn walk(o: &Object, strings: &dyn Fn(&PdfString) -> PdfString, h: &SecurityHandl
                 _ => StreamKind::Normal,
             };
             let raw = if decrypt { h.decrypt_stream(num, generation, &s.raw, kind) } else { h.encrypt_stream(num, generation, &s.raw, kind) };
-            Object::Stream(Stream { dict, raw: std::sync::Arc::new(raw) })
+            Object::Stream(Stream { dict, raw: raw.into() })
         }
         other => other.clone(),
     }

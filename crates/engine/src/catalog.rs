@@ -14,7 +14,7 @@ pub enum Availability {
     Ready,
     /// Planned; ships in the named milestone.
     Planned(&'static str),
-    /// Cloud-only in Acrobat; PrintCraft offers an optional pluggable provider instead.
+    /// Cloud-only in Acrobat; PdfCraft offers an optional pluggable provider instead.
     Provider,
 }
 
@@ -99,6 +99,8 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
                 item("Date", "clock-3", "sign.fill.date", Ready),
                 item("Signature", "signature", "sign.fill.signature", Ready),
                 item("Initials", "signature", "sign.fill.initials", Ready),
+                item("Change signature", "signature", "sign.fill.signature.change", Ready),
+                item("Change initials", "signature", "sign.fill.initials.change", Ready),
             ],
         }],
     },
@@ -147,7 +149,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             title: "Create from",
             items: &[
                 item("Single file", "file-input", "create.file", Ready),
-                item("Multiple files", "files", "create.multiple", Planned("M10")),
+                item("Multiple files", "files", "create.multiple", Ready),
                 item("Images", "image", "create.images", Ready),
                 item("Clipboard", "copy-plus", "create.clipboard", Ready),
                 item("Blank page", "file-plus-2", "create.blank", Ready),
@@ -401,11 +403,17 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         icon: "ruler",
         hue: PINK,
         badge: None,
-        availability: Planned("M12"),
+        availability: Ready,
         sections: &[ToolSection {
             title: "Measure",
             items: &[
-                item("Measuring tool", "ruler", "measure.distance", Planned("M12")),
+                item("Distance", "ruler", "measure.distance", Ready),
+                item("Perimeter", "ruler", "measure.perimeter", Ready),
+                item("Area", "ruler", "measure.area", Ready),
+                item("Drawing scale", "ruler", "measure.scale", Ready),
+                item("Measurement information", "ruler", "measure.info", Ready),
+                item("Snapping", "ruler", "measure.snap", Ready),
+                item("Export measurements", "file-output", "measure.export", Ready),
                 item("Geospatial location", "compass", "measure.geo", Planned("M12")),
             ],
         }],

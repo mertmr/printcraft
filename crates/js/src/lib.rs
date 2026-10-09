@@ -1,4 +1,4 @@
-//! printcraft-js — Acrobat JavaScript for forms (L3).
+//! pdfcraft-js — Acrobat JavaScript for forms (L3).
 //!
 //! Field scripts (format, keystroke, validate, calculate), button actions and document-level
 //! scripts run in [boa](https://boajs.dev), a JavaScript engine written in Rust, with the subset
@@ -152,11 +152,13 @@ pub enum Request {
     /// `this.pageNum = n` (0-based).
     GoToPage(usize),
     LaunchUrl(String),
-    /// `this.submitForm(url)`: never sent on PrintCraft's own.
+    /// `this.submitForm(url)`: never sent on PdfCraft's own.
     Submit(String),
     /// `field.setFocus()`.
     Focus(String),
     Beep,
+    /// `app.execMenuItem("SaveAs")` (XFA forms' Save buttons).
+    SaveAs,
 }
 
 /// What running a script did.
@@ -989,7 +991,7 @@ fn event_object(ctx: &mut Context, e: &Event) -> JsObject {
 // construct (a few KiB per level, several bytes of source each) by the length limit.
 
 /// Longest script, in bytes.
-const MAX_SCRIPT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_SCRIPT_BYTES: usize = 256 * 1024;
 /// Deepest nesting of `(`, `[` and `{`.
 const MAX_BRACKET_DEPTH: usize = 64;
 /// Longest run of prefix operators (`!`, `~`, `+`, `-`).
@@ -1080,7 +1082,7 @@ pub fn run(script: &str, event: &Event, doc: &DocInfo, fields: &[FieldState], do
     {
         std::thread::scope(|scope| {
             let spawned = std::thread::Builder::new()
-                .name("printcraft-js".into())
+                .name("pdfcraft-js".into())
                 .stack_size(SCRIPT_STACK)
                 .spawn_scoped(scope, || run_here(script, event, doc, fields, doc_scripts, limits));
             match spawned {
@@ -1137,6 +1139,9 @@ fn run_here(script: &str, event: &Event, doc: &DocInfo, fields: &[FieldState], d
     }
     out
 }
+
+pub mod formcalc;
+pub mod xfa;
 
 #[cfg(test)]
 mod tests;

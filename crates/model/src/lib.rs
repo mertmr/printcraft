@@ -1,8 +1,8 @@
-//! printcraft-model — typed views over the PDF object graph (L2). See the README.
+//! pdfcraft-model — typed views over the PDF object graph (L2). See the README.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use printcraft_cos::{Dict, Document, ObjRef, Object};
+use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
 /// Attributes a page inherits from its ancestors (ISO 32000-2 §7.7.3.4).
 pub const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
@@ -49,13 +49,21 @@ impl Page {
     /// The matrix `[a b c d e f]` from display space (origin at the bottom-left of the page as
     /// shown, y up, after `/Rotate`) to user space.
     pub fn view_matrix(&self, doc: &Document) -> [f64; 6] {
-        let [x0, y0, x1, y1] = self.crop(doc);
-        match self.rotation(doc) {
-            90 => [0.0, 1.0, -1.0, 0.0, x1, y0],
-            180 => [-1.0, 0.0, 0.0, -1.0, x1, y1],
-            270 => [0.0, -1.0, 1.0, 0.0, x0, y1],
-            _ => [1.0, 0.0, 0.0, 1.0, x0, y0],
-        }
+        view_matrix_for(self.rotation(doc), self.crop(doc))
+    }
+}
+
+/// [`Page::view_matrix`] for a region `crop` (`[x0, y0, x1, y1]`) shown turned clockwise by
+/// `rotation` (0, 90, 180 or 270): the matrix from the turned region's own display space
+/// (origin at its bottom-left, y up) to the region's space. For a rectangle in user space it
+/// puts an upright picture into that rectangle as the page displays it.
+pub fn view_matrix_for(rotation: i64, crop: [f64; 4]) -> [f64; 6] {
+    let [x0, y0, x1, y1] = crop;
+    match rotation {
+        90 => [0.0, 1.0, -1.0, 0.0, x1, y0],
+        180 => [-1.0, 0.0, 0.0, -1.0, x1, y1],
+        270 => [0.0, -1.0, 1.0, 0.0, x0, y1],
+        _ => [1.0, 0.0, 0.0, 1.0, x0, y0],
     }
 }
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use printcraft_cos::{SaveOptions, write_full};
+use pdfcraft_cos::{SaveOptions, write_full};
 
 use super::*;
 
@@ -81,6 +81,32 @@ fn images_become_pages_at_their_resolution() {
     let title = doc.resolve(doc.trailer().get(b"Info").unwrap());
     assert_eq!(title.as_dict().unwrap().get(b"Title").unwrap().as_string().unwrap().to_text(), "photo");
     assert!(matches!(from_images(&[("x.gif".into(), b"GIF89a".to_vec())]), Err(CreateError::Image(..))));
+}
+
+#[test]
+fn image_resolution_override_changes_size_without_resampling() {
+    let images = [("photo.png".into(), png_bytes(true)), ("scan.jpg".into(), jpeg_bytes())];
+    for (dpi, sizes) in [(72.0, [(4.0, 2.0), (3.0, 2.0)]), (300.0, [(0.96, 0.48), (0.72, 0.48)])] {
+        let doc = reopen(&from_images_with_resolution(&images, ImageResolution::Dpi(dpi)).unwrap());
+        for (page, size) in pages(&doc).iter().zip(sizes) {
+            let m = media(page);
+            assert!((m[2] - size.0).abs() < 0.001 && (m[3] - size.1).abs() < 0.001);
+            let res = doc.resolve(page.get(b"Resources").unwrap());
+            let xo = doc.resolve(res.as_dict().unwrap().get(b"XObject").unwrap());
+            let img = doc.resolve(xo.as_dict().unwrap().get(b"Im0").unwrap());
+            let Object::Stream(stream) = &*img else { panic!("expected an image stream") };
+            if stream.dict.name(b"Filter") == Some(&b"DCTDecode"[..]) {
+                assert_eq!(*stream.raw, jpeg_bytes());
+            } else {
+                assert_eq!(stream.dict.int(b"Width"), Some(4));
+                assert_eq!(stream.dict.int(b"Height"), Some(2));
+                assert!(stream.dict.contains(b"SMask"));
+            }
+        }
+    }
+    for dpi in [0.0, -1.0, f64::NAN, f64::INFINITY, 1201.0] {
+        assert!(matches!(from_images_with_resolution(&images, ImageResolution::Dpi(dpi)), Err(CreateError::Invalid(_))));
+    }
 }
 
 #[test]
@@ -168,7 +194,7 @@ fn images_export_as_jpeg_unchanged_and_others_as_png() {
 fn indexed_and_one_bit_images_decode() {
     let mut doc = from_images(&[("flat.png".into(), png_bytes(false))]).unwrap();
     // Replace the page's image with a 4×1 indexed image (two colours) and add a 1-bit mask.
-    let page = printcraft_model::pages(&doc)[0].clone();
+    let page = pdfcraft_model::pages(&doc)[0].clone();
     let res = doc.resolve(page.dict.get(b"Resources").unwrap()).as_dict().cloned().unwrap();
     let xo = doc.resolve(res.get(b"XObject").unwrap()).as_dict().cloned().unwrap();
     let (_, r) = xo.iter().next().map(|(k, v)| (k.clone(), v.as_ref().unwrap())).unwrap();
@@ -231,4 +257,19 @@ fn jpeg_2000_images_are_embedded_as_is() {
     }
     let doc = reopen(&from_images(&[("raw.j2k".into(), siz)]).unwrap());
     assert_eq!(media(&pages(&doc)[0])[2], 64.0);
+}
+
+#[test]
+fn source_kind_tells_pdfs_images_and_text_apart() {
+    assert_eq!(source_kind("a.bin", b"%PDF-1.7\n"), Some(SourceKind::Pdf));
+    assert_eq!(source_kind("a.txt", b"junk before\n%PDF-1.4"), Some(SourceKind::Pdf), "a header after leading junk");
+    assert_eq!(source_kind("a", &png_bytes(false)), Some(SourceKind::Image));
+    assert_eq!(source_kind("a.txt", &jpeg_bytes()), Some(SourceKind::Image), "bytes win over the name");
+    assert_eq!(source_kind("notes.TXT", b"hello"), Some(SourceKind::Text));
+    assert_eq!(source_kind("notes.text", b""), Some(SourceKind::Text));
+    // Text that merely starts like a BMP stays text; a truncated BMP header is not an image.
+    assert_eq!(source_kind("b.txt", b"BMW drivers"), Some(SourceKind::Text));
+    assert_eq!(source_kind("b.bmp", b"BM"), None);
+    assert_eq!(source_kind("a.docx", b"PK\x03\x04"), None);
+    assert_eq!(source_kind("", b""), None);
 }

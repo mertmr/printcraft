@@ -1,7 +1,7 @@
-# printcraft-forms
+# pdfcraft-forms
 
-Interactive forms (AcroForm, ISO 32000-2 §12.7). Layer L3; depends on `printcraft-cos` and
-`printcraft-fonts`.
+Interactive forms (AcroForm, ISO 32000-2 §12.7). Layer L3; depends on `pdfcraft-cos` and
+`pdfcraft-fonts`.
 
 ## API
 
@@ -27,7 +27,7 @@ delete_field(&mut doc, "email")?;
   multiline wrapping, password masking, quadding, `/MK` background and border, list-box selection.
   The `/DA` font is used when `/DR` has it as a simple font; otherwise Helvetica (WinAnsi).
 - Check boxes and radio buttons switch `/V` and each widget's `/AS`. Widgets with no appearances
-  get PrintCraft's own (a drawn check mark or dot; no symbol font needed).
+  get PdfCraft's own (a drawn check mark or dot; no symbol font needed).
 - Values are validated (options, `MaxLen`, single vs multi-select, NoToggleToOff, read-only) and a
   failed call changes nothing.
 - `/RV` (rich text) is removed when a value is set so it can't contradict `/V`.
@@ -39,5 +39,6 @@ delete_field(&mut doc, "email")?;
 ## Not yet
 
 JavaScript actions (format, keystroke, validate, calculate; M6.4/M6.5), rich-text values,
-`/MK /R` rotation, the Appearance (colours, fonts), Actions, Format, Validate and Calculate
-property tabs, FDF/XFDF import and export (M6.7).
+the Appearance (colours, fonts), Actions, Format, Validate and Calculate property tabs,
+FDF/XFDF import and export (M6.7). `/MK /R` rotation (0, 90, 180, 270) is drawn into the
+appearance.

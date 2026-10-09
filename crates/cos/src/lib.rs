@@ -1,26 +1,31 @@
-//! printcraft-cos — the PDF object layer (L1, standalone with `printcraft-filters`).
+//! pdfcraft-cos — the PDF object layer (L1, standalone with `pdfcraft-filters`).
 //!
 //! Parses the COS object graph lazily and tolerantly, keeps edits in a copy-on-write overlay
 //! (cheap snapshots for undo), and writes documents back either incrementally (original bytes
-//! untouched) or as a full, garbage-collected rewrite. The PDF object graph *is* PrintCraft's
+//! untouched) or as a full, garbage-collected rewrite. The PDF object graph *is* PdfCraft's
 //! document model (plan/architecture.md §5, ADR-0010).
 //!
-//! Status (M1 in progress): parsing of all xref forms, object streams, repair by scanning,
-//! incremental and full writing. Not yet: encryption (M1.6), object-stream / xref-stream output
-//! for full saves, linearization (M11).
+//! Done: every cross-reference form (tables, streams, hybrid `/XRefStm`), object streams, repair
+//! by scanning, encryption on load and save (R2–R6, crypt filters, `/EFF`), incremental writing,
+//! and full saves that pack objects into compressed object streams with a cross-reference stream.
+//! Not yet: streaming very large files within a memory budget (`ByteSource`,
+//! `core.lazy-loading`), and linearized output (`core.linearization`, M11). See the README.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod bytes;
 mod document;
 mod object;
+pub mod page_labels;
 mod parser;
 mod security;
 mod writer;
 
-pub use document::{Document, Revision, XrefEntry};
+pub use bytes::Bytes;
+pub use document::{Document, Revision, SourceIdentity, XrefEntry};
 pub use object::{Dict, MAX_DECODED, Name, ObjRef, Object, PdfString, Stream};
 pub use parser::{Lexer, parse_indirect};
-pub use printcraft_crypt::{Algorithm, Auth, Method as CryptMethod, NewEncryption, Permissions, SecurityHandler};
+pub use pdfcraft_crypt::{Algorithm, Auth, Method as CryptMethod, NewEncryption, Permissions, SecurityHandler};
 pub use writer::{SaveOptions, pdf_date, serialize, write_full, write_incremental};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
@@ -43,4 +48,6 @@ pub enum CosError {
     Security(String),
     #[error("internal lock poisoned")]
     Poisoned,
+    #[error("this document was opened read-only with a decode limit and cannot be saved")]
+    ReadOnlyLimit,
 }

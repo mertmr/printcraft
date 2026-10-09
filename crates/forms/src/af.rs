@@ -1074,7 +1074,7 @@ mod tests {
 
 // ── push buttons ────────────────────────────────────────────────────────────────────────────
 
-/// What clicking a push button does (its mouse-up action), as far as PrintCraft can run it
+/// What clicking a push button does (its mouse-up action), as far as PdfCraft can run it
 /// without a JavaScript engine.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ButtonAction {
@@ -1088,20 +1088,41 @@ pub enum ButtonAction {
     Uri(String),
     /// Go to a page (0-based) in this document.
     GoTo(usize),
+    /// A hide action (§12.6.4.11): hide the listed fields (and their kids), or show them when
+    /// `hide` is false.
+    ShowHide {
+        fields: Vec<String>,
+        hide: bool,
+    },
+    /// A set-layer-visibility action (`SetOCGState`, §12.6.4.13): each change in order, naming
+    /// the layer by its optional content group (object number, generation). With `preserve_rb`,
+    /// a layer turned on turns off the other layers of its radio-button groups.
+    SetLayers {
+        changes: Vec<(LayerOp, (u32, u16))>,
+        preserve_rb: bool,
+    },
     /// `app.alert("…")`.
     Alert(String),
-    /// Submit the form to a URL (not sent: PrintCraft never posts form data on its own).
+    /// Submit the form to a URL (not sent: PdfCraft never posts form data on its own).
     Submit(String),
     /// `event.target.buttonImportIcon()`: choose an image for the button (an image field).
     ImportIcon,
-    /// A script PrintCraft can't run yet.
+    /// A script PdfCraft can't run yet.
     Script(String),
+}
+
+/// What a set-layer-visibility action does to a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerOp {
+    On,
+    Off,
+    Toggle,
 }
 
 /// Recognise the common one-line button scripts.
 pub fn button_script(js: &str) -> ButtonAction {
     let t = js.trim();
-    // Print takes an options object whose contents don't change what PrintCraft does.
+    // Print takes an options object whose contents don't change what PdfCraft does.
     if t.starts_with("this.print(") || t.starts_with("print(") || t.contains(";this.print(") || t.contains("; this.print(") {
         return ButtonAction::Named("Print".into());
     }

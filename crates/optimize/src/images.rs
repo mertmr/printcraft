@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use printcraft_content::Matrix;
-use printcraft_cos::{Dict, Document, ObjRef, Object, Stream};
+use pdfcraft_content::Matrix;
+use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
-use crate::{Compression, ImageSettings, OptimizeError, Report, Settings};
+use crate::{Compression, ImageSettings, OptimizeError, Report, Settings, Stage};
 
 /// Images with more pixels than this are left alone (memory).
 const MAX_PIXELS: u64 = 80_000_000;
@@ -49,14 +49,12 @@ fn walk(doc: &Document, data: &[u8], resources: &Dict, ctm: Matrix, depth: usize
     }
     let xobjects = resources.get(b"XObject").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned()).unwrap_or_default();
     let mut stack = vec![ctm];
-    for op in printcraft_content::parse(data).ops {
+    for op in pdfcraft_content::parse(data).ops {
         let top = stack.last().copied().unwrap_or(ctm);
         match op.op.as_slice() {
             b"q" => stack.push(top),
-            b"Q" => {
-                if stack.len() > 1 {
-                    stack.pop();
-                }
+            b"Q" if stack.len() > 1 => {
+                stack.pop();
             }
             b"cm" => {
                 if let Some(m) = Matrix::from_operands(&op.operands)
@@ -112,7 +110,7 @@ pub fn effective_resolutions(doc: &Document, pages: &[ObjRef]) -> HashMap<ObjRef
     out
 }
 
-/// Colour components of a colour space PrintCraft resamples: gray (1) or RGB (3).
+/// Colour components of a colour space PdfCraft resamples: gray (1) or RGB (3).
 fn components(doc: &Document, cs: &Object) -> Option<usize> {
     let cs = doc.resolve(cs);
     match &*cs {
@@ -294,7 +292,13 @@ fn process(doc: &Document, s: &Stream, ppi: f64, settings: &ImageSettings, n: us
     (after < before).then_some((new, smask))
 }
 
-pub(crate) fn run(doc: &mut Document, pages: &[ObjRef], settings: &Settings, report: &mut Report) -> Result<(), OptimizeError> {
+pub(crate) fn run(
+    doc: &mut Document,
+    pages: &[ObjRef],
+    settings: &Settings,
+    report: &mut Report,
+    progress: &mut dyn FnMut(Stage) -> bool,
+) -> Result<(), OptimizeError> {
     let ppi = effective_resolutions(doc, pages);
     // Soft masks are processed with their image, not on their own.
     let masks: HashSet<ObjRef> = ppi
@@ -306,7 +310,11 @@ pub(crate) fn run(doc: &mut Document, pages: &[ObjRef], settings: &Settings, rep
         .collect();
     let mut refs: Vec<(ObjRef, f64)> = ppi.into_iter().filter(|(r, _)| !masks.contains(r)).collect();
     refs.sort_by_key(|(r, _)| r.num);
-    for (r, ppi) in refs {
+    let total = refs.len();
+    for (done, (r, ppi)) in refs.into_iter().enumerate() {
+        if !progress(Stage::Images { done, total }) {
+            return Err(OptimizeError::Cancelled);
+        }
         let obj = doc.get(r);
         let Object::Stream(s) = &*obj else { continue };
         report.images += 1;
@@ -325,6 +333,9 @@ pub(crate) fn run(doc: &mut Document, pages: &[ObjRef], settings: &Settings, rep
         if let Some((mr, m)) = smask {
             doc.set(mr, Object::Stream(m));
         }
+    }
+    if !progress(Stage::Images { done: total, total }) {
+        return Err(OptimizeError::Cancelled);
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 //! Form tools: list fields, fill them (several at once, one undo step), clear the form, and
 //! prepare a form (add, change and delete fields).
 
-use printcraft_engine::form_scripts::{CalcOp, Calculate, Format, Validate};
-use printcraft_engine::{Edit, FieldProps, FieldValue, FormField, FormFieldKind, NewField, field_flags};
+use pdfcraft_engine::form_scripts::{CalcOp, Calculate, Format, Validate};
+use pdfcraft_engine::{Edit, FieldProps, FieldValue, FormField, FormFieldKind, NewField, field_flags};
 use serde_json::{Value, json};
 
 use crate::{Args, Automation, Result, ToolError, failed};
@@ -43,8 +43,8 @@ fn format_arg(v: &Value) -> Result<Format> {
 
 /// `{"border": "#FF0000" | "none", "fill": …, "width": 1-3, "style": "solid"|…, "text_color": …,
 /// "font": "helvetica"|"times"|"courier"}`, changing only what is given.
-fn look_arg(v: &Value, mut l: printcraft_engine::FieldLook) -> Result<printcraft_engine::FieldLook> {
-    use printcraft_engine::{BorderStyle, FieldFont};
+fn look_arg(v: &Value, mut l: pdfcraft_engine::FieldLook) -> Result<pdfcraft_engine::FieldLook> {
+    use pdfcraft_engine::{BorderStyle, FieldFont};
     let o = v.as_object().ok_or_else(|| bad("appearance must be an object"))?;
     let colour = |k: &str| -> Result<Option<Option<[f64; 3]>>> {
         match o.get(k) {
@@ -189,10 +189,12 @@ impl Automation {
                     "value": match f.kind {
                         FormFieldKind::CheckBox => json!(!f.value.is_empty()),
                         FormFieldKind::List if f.has(field_flags::MULTI_SELECT) => json!(f.value),
+                        FormFieldKind::Radio => json!(f.value.first().map(|v| f.export_for_state(v))),
                         _ => json!(f.value.first()),
                     },
                     "page": w.and_then(|w| w.page).map(|p| p + 1),
                     "rect": rect,
+                    "rotation": w.map(|w| w.rotation).unwrap_or(0),
                     "read_only": f.read_only(),
                     "required": f.has(field_flags::REQUIRED),
                 });
@@ -206,7 +208,7 @@ impl Automation {
                 }
                 if f.actions.format != Format::None {
                     o.insert("format".into(), format_json(&f.actions.format));
-                    o.insert("display".into(), json!(f.value.first().map(|v| printcraft_engine::form_scripts::format_value(&f.actions.format, v))));
+                    o.insert("display".into(), json!(f.value.first().map(|v| pdfcraft_engine::form_scripts::format_value(&f.actions.format, v))));
                 }
                 if let Validate::Range { min, max } = &f.actions.validate {
                     o.insert("validate".into(), json!({ "min": min, "max": max }));
@@ -225,7 +227,7 @@ impl Automation {
                 }
                 match f.kind {
                     FormFieldKind::Radio => {
-                        o.insert("options".into(), json!(f.widgets.iter().filter_map(|w| w.on_state.clone()).collect::<Vec<_>>()));
+                        o.insert("options".into(), json!((0..f.widgets.len()).filter_map(|i| f.export_of(i)).collect::<Vec<_>>()));
                     }
                     FormFieldKind::Combo | FormFieldKind::List => {
                         o.insert("options".into(), f.options.iter().map(|(e, d)| json!({ "value": e, "label": d })).collect());
@@ -367,7 +369,7 @@ impl Automation {
             flags: match a.get("flags") {
                 None => Vec::new(),
                 Some(v) => {
-                    use printcraft_engine::field_flags as ff;
+                    use pdfcraft_engine::field_flags as ff;
                     let obj = v.as_object().ok_or_else(|| bad("flags must be an object of booleans"))?;
                     let mut out = Vec::new();
                     for (k, on) in obj {
@@ -393,11 +395,16 @@ impl Automation {
                     out
                 }
             },
+            rotation: match a.opt_int("rotation")? {
+                None => None,
+                Some(r @ (0 | 90 | 180 | 270)) => Some((0, r)),
+                Some(r) => return Err(ToolError::InvalidArgs(format!("rotation must be 0, 90, 180 or 270, not {r}"))),
+            },
             actions: None,
             check_style: match a.opt_str("check_style")? {
                 None => None,
                 Some(s) => Some(
-                    printcraft_engine::CheckStyle::ALL
+                    pdfcraft_engine::CheckStyle::ALL
                         .into_iter()
                         .find(|c| c.label().eq_ignore_ascii_case(s))
                         .ok_or_else(|| bad(format!("unknown check style {s:?} (check, circle, cross, diamond, square, star)")))?,
@@ -431,10 +438,10 @@ impl Automation {
             return Ok(out);
         }
         let order = match a.str("order")? {
-            "row" | "rows" => printcraft_engine::TabOrder::Row,
-            "column" | "columns" => printcraft_engine::TabOrder::Column,
-            "structure" => printcraft_engine::TabOrder::Structure,
-            "annotations" | "unspecified" => printcraft_engine::TabOrder::Annotations,
+            "row" | "rows" => pdfcraft_engine::TabOrder::Row,
+            "column" | "columns" => pdfcraft_engine::TabOrder::Column,
+            "structure" => pdfcraft_engine::TabOrder::Structure,
+            "annotations" | "unspecified" => pdfcraft_engine::TabOrder::Annotations,
             o => return Err(bad(format!("unknown order {o:?} (row, column, structure, annotations)"))),
         };
         let mut out = self.apply(a, Edit::SetTabOrder { pages, order })?;
@@ -463,15 +470,14 @@ impl Automation {
         let id = self.doc(a)?.id;
         let path = self.resolve(a.str("path")?, true)?;
         let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-        let format =
-            printcraft_engine::DataFormat::from_extension(&ext).ok_or_else(|| bad("the path must end in .xfdf, .fdf, .xml, .csv or .txt"))?;
+        let format = pdfcraft_engine::DataFormat::from_extension(&ext).ok_or_else(|| bad("the path must end in .xfdf, .fdf, .xml, .csv or .txt"))?;
         let (comments, fields) = match a.opt_str("what")?.unwrap_or("all") {
             "all" => (true, true),
             "comments" => (true, false),
             "fields" => (false, true),
             w => return Err(bad(format!("unknown what {w:?} (all, comments, fields)"))),
         };
-        if comments && !matches!(format, printcraft_engine::DataFormat::Xfdf | printcraft_engine::DataFormat::Fdf) {
+        if comments && !matches!(format, pdfcraft_engine::DataFormat::Xfdf | pdfcraft_engine::DataFormat::Fdf) {
             return Err(bad("comments travel as .xfdf or .fdf; .xml, .csv and .txt hold form data (use what: fields)"));
         }
         let bytes = self.session.export_data(id, format, comments, fields).map_err(failed)?;

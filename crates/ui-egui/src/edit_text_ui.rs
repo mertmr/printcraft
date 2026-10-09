@@ -1,12 +1,12 @@
 //! Edit a PDF ▸ Edit text & images: boxes around the paragraphs and images already on the page.
 //! Click a paragraph to edit it in place (⌘Enter or clicking away applies and rewraps it to the
-//! box, Esc cancels); drag it to move it, or drag the handle on its right edge to rewrap it to a
-//! new width. Click an image to select it: drag to move, drag a corner to resize (keeping
+//! box, Esc cancels); drag it to move it, or drag the handle on its left or right edge to rewrap
+//! it to a new width. Click an image to select it: drag to move, drag a corner to resize (keeping
 //! its proportions), right-click for rotate, flip, replace, save and delete; Delete removes it.
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Stroke};
-use printcraft_engine::Edit;
-use printcraft_render::DocInfo;
+use pdfcraft_engine::Edit;
+use pdfcraft_render::DocInfo;
 
 use crate::canvas::{DocView, PageXform};
 
@@ -31,8 +31,8 @@ pub struct LineEditor {
     size: f32,
     focus: bool,
     /// The Format text panel's values, and what the paragraph had (to send only changes).
-    pub look: printcraft_engine::AddedText,
-    look0: printcraft_engine::AddedText,
+    pub look: pdfcraft_engine::AddedText,
+    look0: pdfcraft_engine::AddedText,
     /// Underline, line spacing (× size; 0 = the paragraph's own), character spacing (pt) and
     /// horizontal scale (%), and what they were.
     pub extras: Extras,
@@ -58,10 +58,11 @@ impl Default for Extras {
 pub(crate) fn extras_panel(ui: &mut egui::Ui, e: &mut Extras) -> bool {
     let before = *e;
     ui.horizontal(|ui| {
-        if crate::icons::button(ui, "underline", 26.0, e.underline, "Underline").clicked() {
+        if crate::icons::button(ui, "underline", 26.0, e.underline, tl!("Underline")).clicked() {
             e.underline = !e.underline;
         }
-        let label = |v: f64| if v == 0.0 { "Line spacing".to_string() } else { format!("{v:.2}×") };
+        let zero = tl!("Line spacing").to_string();
+        let label = |v: f64| if v == 0.0 { zero.clone() } else { format!("{v:.2}×") };
         egui::ComboBox::from_id_salt("line-spacing").selected_text(label(e.line_spacing)).width(110.0).show_ui(ui, |ui| {
             for v in [1.0, 1.15, 1.5, 2.0] {
                 ui.selectable_value(&mut e.line_spacing, v, label(v));
@@ -69,11 +70,11 @@ pub(crate) fn extras_panel(ui: &mut egui::Ui, e: &mut Extras) -> bool {
         });
     });
     ui.horizontal(|ui| {
-        let l = ui.label("Character spacing");
+        let l = ui.label(tl!("Character spacing"));
         ui.add(egui::DragValue::new(&mut e.char_spacing).range(-5.0..=50.0).speed(0.1).suffix(" pt")).labelled_by(l.id);
     });
     ui.horizontal(|ui| {
-        let l = ui.label("Horizontal scale");
+        let l = ui.label(tl!("Horizontal scale"));
         ui.add(egui::DragValue::new(&mut e.scale).range(10.0..=400.0).speed(1.0).suffix(" %")).labelled_by(l.id);
     });
     *e != before
@@ -87,9 +88,9 @@ impl LineEditor {
     }
 
     /// The formatting the panel changed.
-    pub fn style(&self) -> printcraft_engine::BlockStyle {
+    pub fn style(&self) -> pdfcraft_engine::BlockStyle {
         let (l, o) = (&self.look, &self.look0);
-        printcraft_engine::BlockStyle {
+        pdfcraft_engine::BlockStyle {
             family: (l.family != o.family || l.bold != o.bold || l.italic != o.italic).then_some((l.family, l.bold, l.italic)),
             size: (l.size != o.size).then_some(l.size),
             color: (l.color != o.color).then_some(l.color),
@@ -112,15 +113,15 @@ impl LineEditor {
     }
 
     /// Adopt the rewritten paragraph's current geometry before the next overlay frame.
-    pub(crate) fn refresh_source(&mut self, block: &printcraft_engine::TextBlock) {
+    pub(crate) fn refresh_source(&mut self, block: &pdfcraft_engine::TextBlock) {
         self.source_rect = block.rect.map(|v| v as f32);
         self.multiline = block.lines.len() > 1;
     }
 }
 
 /// The look shown for a paragraph: the family and weight guessed from its PDF font name.
-fn source_look(base_font: &str, size: f64, color: [f64; 3], detected_bold: bool, detected_italic: bool) -> printcraft_engine::AddedText {
-    use printcraft_engine::FontFamily as F;
+fn source_look(base_font: &str, size: f64, color: [f64; 3], detected_bold: bool, detected_italic: bool) -> pdfcraft_engine::AddedText {
+    use pdfcraft_engine::FontFamily as F;
     let name = base_font.to_ascii_lowercase();
     let family = if ["courier", "mono", "consolas", "menlo", "monaco", "lucida console"].iter().any(|s| name.contains(s)) {
         F::Courier
@@ -129,7 +130,7 @@ fn source_look(base_font: &str, size: f64, color: [f64; 3], detected_bold: bool,
     } else {
         F::Helvetica
     };
-    printcraft_engine::AddedText {
+    pdfcraft_engine::AddedText {
         family,
         bold: detected_bold || ["bold", "black", "heavy", "semibold", "demi"].iter().any(|s| name.contains(s)),
         italic: detected_italic || ["italic", "oblique", "slanted"].iter().any(|s| name.contains(s)),
@@ -139,13 +140,13 @@ fn source_look(base_font: &str, size: f64, color: [f64; 3], detected_bold: bool,
     }
 }
 
-fn look_of(b: &printcraft_engine::TextBlock) -> printcraft_engine::AddedText {
+fn look_of(b: &pdfcraft_engine::TextBlock) -> pdfcraft_engine::AddedText {
     source_look(&b.base_font, b.size, b.color, b.bold, b.italic)
 }
 
-fn editor_font(look: &printcraft_engine::AddedText, size: f32) -> FontId {
+fn editor_font(look: &pdfcraft_engine::AddedText, size: f32) -> FontId {
     let family = match (look.family, look.bold) {
-        (printcraft_engine::FontFamily::Courier, _) => FontFamily::Monospace,
+        (pdfcraft_engine::FontFamily::Courier, _) => FontFamily::Monospace,
         (_, true) => FontFamily::Name("semibold".into()),
         (_, false) => FontFamily::Proportional,
     };
@@ -169,19 +170,56 @@ pub struct ImageSelection {
     drag: Option<(Pos2, Option<Pos2>)>,
 }
 
-/// A paragraph box being dragged: moved, or (from the handle on its right edge) resized.
+/// What a drag on a paragraph box takes hold of.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Grip {
+    Move,
+    /// An edge (screen left or right), dragged to rewrap the paragraph.
+    Left,
+    Right,
+}
+
+/// A paragraph box being dragged: moved, or (from a handle on its left or right edge) resized.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BlockDrag {
     page: usize,
     block: usize,
     /// Where the drag started (screen).
     start: Pos2,
-    resize: bool,
+    grip: Grip,
 }
 
-/// The resize handle on a paragraph box's right edge (screen).
-fn width_handle(b: Rect) -> Rect {
-    Rect::from_center_size(Pos2::new(b.right(), b.center().y), egui::vec2(7.0, 14.0))
+/// How far an edge grip reaches either side of a box's edge (screen pixels).
+const EDGE_REACH: f32 = 6.0;
+
+/// The rewrap handles drawn on a paragraph box's left and right edges (screen).
+fn width_handles(b: Rect) -> [Rect; 2] {
+    let h = (b.height() * 0.5).clamp(14.0, 28.0);
+    [b.left(), b.right()].map(|x| Rect::from_center_size(Pos2::new(x, b.center().y), egui::vec2(7.0, h)))
+}
+
+/// The edge of `b` that `p` grabs: anywhere along its height, within reach of the line. A narrow
+/// box keeps its middle for moving.
+fn edge_at(b: Rect, p: Pos2) -> Option<Grip> {
+    if p.y < b.top() - EDGE_REACH || p.y > b.bottom() + EDGE_REACH {
+        return None;
+    }
+    let inside = EDGE_REACH.min(b.width() / 4.0);
+    let (dl, dr) = (p.x - b.left(), b.right() - p.x);
+    match (dl >= -EDGE_REACH && dl <= inside, dr >= -EDGE_REACH && dr <= inside) {
+        (true, true) if dl <= dr => Some(Grip::Left),
+        (_, true) => Some(Grip::Right),
+        (true, false) => Some(Grip::Left),
+        _ => None,
+    }
+}
+
+/// The topmost box under `p` and what it grabs there; edges only on an upright page.
+fn grab_at(boxes: &[Rect], p: Pos2, upright: bool) -> Option<(usize, Grip)> {
+    boxes.iter().enumerate().rev().find_map(|(i, b)| match upright.then(|| edge_at(*b, p)).flatten() {
+        Some(g) => Some((i, g)),
+        None => b.contains(p).then_some((i, Grip::Move)),
+    })
 }
 
 /// What a right-click on a selected image asks for.
@@ -206,7 +244,7 @@ pub(crate) fn image_input(
     xf: &PageXform,
     page: usize,
     info: &DocInfo,
-    images: &[printcraft_engine::PageImage],
+    images: &[pdfcraft_engine::PageImage],
     view: &mut DocView,
     action: &mut Option<ImageAction>,
 ) -> bool {
@@ -280,14 +318,14 @@ pub(crate) fn image_input(
                 }
                 if preview != b {
                     view.pending_edit =
-                        Some(Edit::EditPageImage { page, index: i, change: printcraft_engine::ImageEdit::Move(user_box(xf, info, page, preview)) });
+                        Some(Edit::EditPageImage { page, index: i, change: pdfcraft_engine::ImageEdit::Move(user_box(xf, info, page, preview)) });
                 }
             }
             return true;
         }
         if ui.input(|inp| inp.key_pressed(egui::Key::Delete) || inp.key_pressed(egui::Key::Backspace)) && !ui.ctx().egui_wants_keyboard_input() {
             view.image_selection = None;
-            view.pending_edit = Some(Edit::EditPageImage { page, index: i, change: printcraft_engine::ImageEdit::Delete });
+            view.pending_edit = Some(Edit::EditPageImage { page, index: i, change: pdfcraft_engine::ImageEdit::Delete });
             return true;
         }
     }
@@ -302,12 +340,12 @@ pub(crate) fn image_input(
     }
     if selected == Some(hit) {
         resp.context_menu(|ui| {
-            use printcraft_engine::ImageEdit as E;
+            use pdfcraft_engine::ImageEdit as E;
             let items: [(&str, Option<E>); 4] = [
-                ("Rotate Clockwise", Some(E::Rotate(1))),
-                ("Rotate Counterclockwise", Some(E::Rotate(3))),
-                ("Flip Horizontal", Some(E::Flip { horizontal: true })),
-                ("Flip Vertical", Some(E::Flip { horizontal: false })),
+                (tl!("Rotate Clockwise"), Some(E::Rotate(1))),
+                (tl!("Rotate Counterclockwise"), Some(E::Rotate(3))),
+                (tl!("Flip Horizontal"), Some(E::Flip { horizontal: true })),
+                (tl!("Flip Vertical"), Some(E::Flip { horizontal: false })),
             ];
             for (label, change) in items {
                 if ui.button(label).clicked() {
@@ -315,16 +353,17 @@ pub(crate) fn image_input(
                     ui.close();
                 }
             }
-            if ui.button("Replace Image…").clicked() {
+            let raster = images.get(hit).is_some_and(|image| !image.is_form);
+            if ui.add_enabled(raster, egui::Button::new(tl!("Replace Image…"))).clicked() {
                 *action = Some(ImageAction::Replace(page, hit));
                 ui.close();
             }
-            if ui.button("Save Image As…").clicked() {
+            if ui.add_enabled(raster, egui::Button::new(tl!("Save Image As…"))).clicked() {
                 *action = Some(ImageAction::Save(page, hit));
                 ui.close();
             }
             ui.separator();
-            if ui.button("Delete").clicked() {
+            if ui.button(tl!("Delete")).clicked() {
                 view.image_selection = None;
                 view.pending_edit = Some(Edit::EditPageImage { page, index: hit, change: E::Delete });
                 ui.close();
@@ -342,7 +381,7 @@ pub(crate) fn page_input(
     xf: &PageXform,
     page: usize,
     info: &DocInfo,
-    lines: &[printcraft_engine::TextBlock],
+    lines: &[pdfcraft_engine::TextBlock],
     view: &mut DocView,
 ) -> bool {
     let boxes: Vec<Rect> = lines.iter().map(|l| xf.user_rect(info, page, l.rect.map(|v| v as f32)).expand(2.0)).collect();
@@ -359,27 +398,40 @@ pub(crate) fn page_input(
     // The width handle needs the page upright (or upside down): on a quarter-turned page the
     // screen's horizontal is the paragraph's vertical.
     let upright = info.pages.get(page).is_some_and(|p| p.rotation % 180 == 0);
-    // A drag in progress: the box follows the pointer (or its right edge does); releasing applies it.
+    let draw_handles = |b: Rect| {
+        for h in width_handles(b) {
+            painter.rect(h, CornerRadius::same(2), Color32::WHITE, Stroke::new(1.0, ACCENT), egui::StrokeKind::Middle);
+        }
+    };
+    // A drag in progress: the box follows the pointer (or the grabbed edge does); releasing applies it.
     if let Some(d) = view.block_drag.filter(|d| d.page == page)
         && let (Some(b), Some(l)) = (boxes.get(d.block).copied(), lines.get(d.block))
     {
         let p = ui.input(|i| i.pointer.interact_pos()).unwrap_or(d.start);
-        let preview = if d.resize {
-            Rect::from_min_max(b.min, Pos2::new((b.right() + p.x - d.start.x).max(b.left() + 12.0), b.max.y))
-        } else {
-            b.translate(p - d.start)
+        let dx = p.x - d.start.x;
+        let preview = match d.grip {
+            Grip::Move => b.translate(p - d.start),
+            Grip::Left => Rect::from_min_max(Pos2::new((b.left() + dx).min(b.right() - 12.0), b.min.y), b.max),
+            Grip::Right => Rect::from_min_max(b.min, Pos2::new((b.right() + dx).max(b.left() + 12.0), b.max.y)),
         };
         painter.rect_stroke(preview, CornerRadius::same(2), Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
-        ui.ctx().set_cursor_icon(if d.resize { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Grabbing });
+        let resizing = d.grip != Grip::Move;
+        if resizing {
+            draw_handles(preview);
+        }
+        ui.ctx().set_cursor_icon(if resizing { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Grabbing });
         if resp.drag_stopped() || !ui.input(|i| i.pointer.any_down()) {
             view.block_drag = None;
             let (from, to) = (user_box(xf, info, page, b), user_box(xf, info, page, preview));
-            let style = if d.resize {
-                // The new width in user space: the box's change, added to the paragraph's own.
+            let style = if resizing {
+                // The new width in user space: the box's change, added to the paragraph's own. A
+                // moved left side (in user space; on an upside-down page that's the screen's right
+                // edge) moves the paragraph with it.
                 let width = (l.rect[2] - l.rect[0]) + (to[2] - to[0]) - (from[2] - from[0]);
-                printcraft_engine::BlockStyle { width: Some(width), ..Default::default() }
+                let shift = to[0] - from[0];
+                pdfcraft_engine::BlockStyle { width: Some(width), offset: (shift != 0.0).then_some([shift, 0.0]), ..Default::default() }
             } else {
-                printcraft_engine::BlockStyle { offset: Some([to[0] - from[0], to[1] - from[1]]), ..Default::default() }
+                pdfcraft_engine::BlockStyle { offset: Some([to[0] - from[0], to[1] - from[1]]), ..Default::default() }
             };
             if preview != b {
                 view.pending_edit = Some(Edit::EditTextBlock { page, block: d.block, text: l.text.clone(), style });
@@ -387,26 +439,28 @@ pub(crate) fn page_input(
         }
         return true;
     }
-    let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| xf.rect.contains(*p)) else { return false };
-    let Some(hit) = boxes.iter().rposition(|b| b.contains(p) || (upright && width_handle(*b).contains(p))) else { return false };
-    if active != Some(hit) {
-        painter.rect_stroke(boxes[hit], CornerRadius::same(2), Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
-    }
-    let on_handle = upright && active.is_none() && width_handle(boxes[hit]).contains(p);
-    if upright && active.is_none() {
-        painter.rect(width_handle(boxes[hit]), CornerRadius::same(2), Color32::WHITE, Stroke::new(1.0, ACCENT), egui::StrokeKind::Middle);
-    }
-    ui.ctx().set_cursor_icon(if on_handle { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Text });
-    // Dragging a box (not while a paragraph is open for typing) moves it; from the handle, resizes it.
+    // Dragging a box (not while a paragraph is open for typing) moves it; from an edge, resizes it.
+    // What it grabs comes from where the button went down, not where the pointer is now: egui
+    // only calls it a drag once the pointer has moved a few pixels (or been held a moment), and a
+    // quick flick has left the edge by then.
     if resp.drag_started()
         && active.is_none()
         && let Some(o) = ui.input(|i| i.pointer.press_origin())
-        && let Some(block) = boxes.iter().rposition(|b| b.contains(o) || (upright && width_handle(*b).contains(o)))
+        && let Some((block, grip)) = grab_at(&boxes, o, upright)
     {
-        let resize = upright && width_handle(boxes[block]).contains(o);
-        view.block_drag = Some(BlockDrag { page, block, start: o, resize });
+        view.block_drag = Some(BlockDrag { page, block, start: o, grip });
         return true;
     }
+    let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| xf.rect.contains(*p)) else { return false };
+    let Some((hit, grip)) = grab_at(&boxes, p, upright) else { return false };
+    if active != Some(hit) {
+        painter.rect_stroke(boxes[hit], CornerRadius::same(2), Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
+    }
+    let on_edge = active.is_none() && grip != Grip::Move;
+    if upright && active.is_none() {
+        draw_handles(boxes[hit]);
+    }
+    ui.ctx().set_cursor_icon(if on_edge { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Text });
     if resp.clicked() {
         let l = &lines[hit];
         // Screen pixels per point, from the box's width.
@@ -495,7 +549,7 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
         Some(apply) => {
             let ed = view.line_editor.take()?;
             let style = ed.style();
-            (apply && (ed.text != ed.original || style != printcraft_engine::BlockStyle::default())).then_some(Edit::EditTextBlock {
+            (apply && (ed.text != ed.original || style != pdfcraft_engine::BlockStyle::default())).then_some(Edit::EditTextBlock {
                 page: ed.page,
                 block: ed.block,
                 text: ed.text,

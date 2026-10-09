@@ -12,6 +12,29 @@ pub enum ThemeKind {
     Dark,
 }
 
+/// The saved user choice, independent of the light/dark colours currently displayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ThemePreference {
+    System,
+    #[default]
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub fn resolve(self, system: Option<egui::Theme>, fallback: ThemeKind) -> ThemeKind {
+        match self {
+            Self::Light => ThemeKind::Light,
+            Self::Dark => ThemeKind::Dark,
+            Self::System => match system {
+                Some(egui::Theme::Light) => ThemeKind::Light,
+                Some(egui::Theme::Dark) => ThemeKind::Dark,
+                None => fallback,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Tokens {
     pub kind: ThemeKind,
@@ -96,7 +119,7 @@ impl Tokens {
     }
 
     pub fn get(ctx: &egui::Context) -> Self {
-        ctx.data(|d| d.get_temp::<Tokens>(egui::Id::new("printcraft-theme"))).unwrap_or_else(|| Self::for_kind(ThemeKind::Light))
+        ctx.data(|d| d.get_temp::<Tokens>(egui::Id::new("pdfcraft-theme"))).unwrap_or_else(|| Self::for_kind(ThemeKind::Light))
     }
 
     pub fn dark(&self) -> bool {
@@ -108,10 +131,45 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(font_definitions());
 }
 
+/// Install the interface fonts with the CJK fallback order for the UI language (Chinese
+/// first for Simplified Chinese, Japanese first otherwise). Call it when the language
+/// changes; the new faces take effect next frame.
+pub fn install_fonts_for(ctx: &egui::Context, prefer_hans: bool) {
+    ctx.set_fonts(installed_font_definitions(prefer_hans));
+}
+
+/// The name of the installed face [`installed_font_definitions`] may add after the embedded ones.
+pub const SYSTEM_FALLBACK: &str = "system-fallback";
+
+/// What [`install_fonts_for`] installs: [`font_definitions_for`], then, on desktop, one face
+/// already installed on this machine as the last fallback of every family. It only draws
+/// characters no embedded face has (an Arabic file name in a build without craft-fonts);
+/// `PDFCRAFT_SYSTEM_FONTS=0` leaves it out.
+pub fn installed_font_definitions(prefer_hans: bool) -> FontDefinitions {
+    #[cfg_attr(target_arch = "wasm32", expect(unused_mut))]
+    let mut fonts = font_definitions_for(prefer_hans);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(data) = crate::system_fonts::fallback() {
+        fonts.font_data.insert(SYSTEM_FALLBACK.to_owned(), data);
+        for stack in fonts.families.values_mut() {
+            stack.push(SYSTEM_FALLBACK.to_owned());
+        }
+    }
+    fonts
+}
+
 /// The interface fonts: Inter (and JetBrains Mono for code) first, then egui's defaults, then
-/// the Japanese faces of the optional craft-fonts build input (BIZ UDPGothic first) as the last
-/// fallback in every family. Without craft-fonts there is no Japanese face.
+/// the CJK, Arabic and Telugu faces of the optional craft-fonts build input as the last fallback
+/// in every family. Without craft-fonts there is no Japanese, Chinese, Arabic or Telugu face here.
 pub fn font_definitions() -> FontDefinitions {
+    font_definitions_for(false)
+}
+
+/// [`font_definitions`] with the CJK fallback order for the UI language. Simplified Chinese
+/// must come first in Chinese mode: otherwise shared characters render in the Japanese face
+/// while Simplified-only characters (e.g. U+6B22 欢) fall through to the Chinese face, and
+/// the mixed vertical metrics sink them below the line.
+pub fn font_definitions_for(prefer_hans: bool) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let add = |fonts: &mut FontDefinitions, name: &str, bytes: &'static [u8]| {
         fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
@@ -122,12 +180,29 @@ pub fn font_definitions() -> FontDefinitions {
     add(&mut fonts, "JetBrainsMono", include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"));
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "Inter".to_owned());
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "JetBrainsMono".to_owned());
-    // The same static bytes printcraft-fonts uses for Japanese text in PDFs: one copy, not two.
-    for face in printcraft_fonts::ui_japanese_fonts() {
+    // The same static bytes pdfcraft-fonts uses for Japanese/Chinese text in PDFs: one copy, not two.
+    for face in pdfcraft_fonts::ui_cjk_fonts(prefer_hans) {
         let name = face.name();
-        add(&mut fonts, &name, face.bytes);
+        // Japanese and Chinese faces have distinct family names, so no collision here.
+        if !fonts.font_data.contains_key(&name) {
+            add(&mut fonts, &name, face.bytes);
+        }
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts.families.entry(family).or_default().push(name.clone());
+        }
+    }
+    // Arabic-script faces (file names, document titles) and Telugu faces (the Telugu interface,
+    // file names) after the CJK ones; the ranges don't overlap.
+    for face in pdfcraft_fonts::ui_arabic_fonts().into_iter().chain(pdfcraft_fonts::ui_telugu_fonts()) {
+        let name = face.name();
+        if !fonts.font_data.contains_key(&name) {
+            add(&mut fonts, &name, face.bytes);
+        }
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            let stack = fonts.families.entry(family).or_default();
+            if !stack.contains(&name) {
+                stack.push(name.clone());
+            }
         }
     }
     let fallback: Vec<String> = fonts.families[&FontFamily::Proportional].clone();
@@ -150,8 +225,10 @@ pub fn semibold(size: f32) -> FontId {
 }
 
 pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
+    // egui must use the same theme for popup/menu styles as our custom chrome.
+    ctx.set_theme(if kind == ThemeKind::Dark { egui::Theme::Dark } else { egui::Theme::Light });
     let t = Tokens::for_kind(kind);
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new("printcraft-theme"), t));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("pdfcraft-theme"), t));
     let mut v = if t.dark() { Visuals::dark() } else { Visuals::light() };
     v.panel_fill = t.panel;
     v.window_fill = t.card;

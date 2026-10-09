@@ -6,11 +6,11 @@
 //! the file (full save).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::CosError;
 use crate::object::{Dict, ObjRef, Object};
-use crate::parser::{Lexer, is_whitespace, parse_indirect};
+use crate::parser::{Lexer, is_whitespace, parse_indirect, parse_indirect_shared};
 
 thread_local! {
     /// The objects being loaded on this thread, innermost last (see `Document::try_get`).
@@ -84,22 +84,38 @@ enum Slot {
     Freed(u16),
 }
 
+/// An immutable input/decode context shared by document clones. Holding this identity
+/// retains neither the input bytes nor the parsed document. Weak ownership prevents an
+/// expired identity from matching a later allocation at the same address.
+#[derive(Clone, Debug)]
+pub struct SourceIdentity(Weak<()>);
+
+impl PartialEq for SourceIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
+impl Eq for SourceIdentity {}
+
 #[derive(Clone)]
 pub struct Document {
     data: Arc<Vec<u8>>,
+    source_identity: Arc<()>,
     entries: Arc<BTreeMap<u32, XrefEntry>>,
     trailer: Dict,
     revisions: Arc<Vec<Revision>>,
     repair_log: Arc<Vec<String>>,
     cache: Arc<Mutex<HashMap<u32, Arc<Object>>>>,
     objstms: Arc<Mutex<HashMap<u32, Arc<ObjStm>>>>,
+    stream_limit: usize,
     overlay: BTreeMap<u32, Slot>,
     next_num: u32,
     /// Position of the `%PDF-` header (some files have junk before it).
     header_offset: usize,
     version: String,
     /// The authenticated security handler of an encrypted document.
-    security: Option<Arc<printcraft_crypt::SecurityHandler>>,
+    security: Option<Arc<pdfcraft_crypt::SecurityHandler>>,
     /// Object number of the `/Encrypt` dictionary (never encrypted itself).
     encrypt_num: Option<u32>,
     /// Encryption was added, changed or removed since opening: only a full save can apply it.
@@ -107,8 +123,82 @@ pub struct Document {
     /// Set by edits that must not leave earlier revisions in the file (redaction).
     full_save: bool,
     /// The handler and `/Encrypt` object number that saves use, when encryption changed.
-    out_security: Option<Arc<printcraft_crypt::SecurityHandler>>,
+    out_security: Option<Arc<pdfcraft_crypt::SecurityHandler>>,
     out_encrypt_num: Option<u32>,
+}
+
+/// A temporary reader for whole-document work. Its caches never populate the editor or
+/// undo snapshots. Returned objects survive cache eviction; a stream read from the file is a
+/// view into the input bytes (it keeps the whole input alive while held, not a copy).
+pub(crate) struct ObjectReader {
+    pub(crate) document: Document,
+    decoded_count: usize,
+}
+
+impl ObjectReader {
+    const OBJECTS: usize = 128;
+    const STREAM_BYTES: usize = 8 * 1024 * 1024;
+
+    pub(crate) fn get(&mut self, reference: ObjRef) -> Arc<Object> {
+        self.try_get(reference).unwrap_or_else(|_| Arc::new(Object::Null))
+    }
+
+    pub(crate) fn try_get(&mut self, reference: ObjRef) -> Result<Arc<Object>, CosError> {
+        let object = self.document.try_get(reference.num);
+        if let Ok(mut streams) = self.document.objstms.lock() {
+            // Only insertion changes this private cache between reads. Most neighboring
+            // objects reuse a decoded stream: do not sum the whole store for every object.
+            if streams.len() != self.decoded_count {
+                let bytes = streams.values().fold(0usize, |bytes, stream| {
+                    bytes
+                        .saturating_add(stream.data.capacity())
+                        .saturating_add(stream.index.capacity().saturating_mul(std::mem::size_of::<(u32, usize)>()))
+                });
+                if bytes > Self::STREAM_BYTES || streams.len() >= Self::OBJECTS {
+                    // Retain one oversized active stream so its next object does not require
+                    // decoding it again. That stream still obeys the document's decode cap.
+                    let current = match self.document.xref_entry(reference.num) {
+                        Some(XrefEntry::InStream { stream, .. }) => Some(stream),
+                        _ => None,
+                    };
+                    streams.retain(|num, _| Some(*num) == current);
+                }
+                self.decoded_count = streams.len();
+            }
+        }
+        // Parsed objects stay cached (an indirect /Length or a dictionary read again costs a
+        // lookup, not a parse) until the cache passes its object count or holds more than
+        // STREAM_BYTES of data of its own. Streams read from the file are views into the
+        // input bytes, which the document keeps anyway, so they don't count; decrypted
+        // streams and strings do. Checked after failed loads too: resolving a /Length may
+        // have cached large objects.
+        if let Ok(mut cache) = self.document.cache.lock() {
+            let data = &self.document.data;
+            if cache.len() >= Self::OBJECTS || cache.values().fold(0usize, |n, o| n.saturating_add(owned_bytes(o, data, 0))) > Self::STREAM_BYTES {
+                cache.clear();
+            }
+        }
+        object
+    }
+}
+
+/// Bytes `object` holds of its own: string and stream data that is not a view into `data`
+/// (the input file), nested a few levels deep (deeper data is rare and still bounded by the
+/// reader's object count).
+fn owned_bytes(object: &Object, data: &Arc<Vec<u8>>, depth: usize) -> usize {
+    if depth > 4 {
+        return 0;
+    }
+    match object {
+        Object::String(s) => s.bytes.len(),
+        Object::Stream(s) => {
+            let own = if s.raw.shares(data) { 0 } else { s.raw.len() };
+            s.dict.iter().fold(own, |n, (_, v)| n.saturating_add(owned_bytes(v, data, depth + 1)))
+        }
+        Object::Array(a) => a.iter().fold(0usize, |n, v| n.saturating_add(owned_bytes(v, data, depth + 1))),
+        Object::Dict(d) => d.iter().fold(0usize, |n, (_, v)| n.saturating_add(owned_bytes(v, data, depth + 1))),
+        _ => 0,
+    }
 }
 
 impl std::fmt::Debug for Document {
@@ -123,12 +213,14 @@ impl Document {
     pub fn new_empty() -> Self {
         let mut doc = Document {
             data: Arc::new(Vec::new()),
+            source_identity: Arc::new(()),
             entries: Arc::new(BTreeMap::new()),
             trailer: Dict::new(),
             revisions: Arc::new(Vec::new()),
             repair_log: Arc::new(Vec::new()),
             cache: Arc::default(),
             objstms: Arc::default(),
+            stream_limit: crate::object::MAX_DECODED,
             overlay: BTreeMap::new(),
             next_num: 1,
             header_offset: 0,
@@ -162,6 +254,14 @@ impl Document {
     /// Parse a document, authenticating encrypted ones with `password` (owner or user; `None`
     /// tries the empty password). Fails with `NeedsPassword` / `WrongPassword` as appropriate.
     pub fn open_with_password(data: Arc<Vec<u8>>, password: Option<&str>) -> Result<Self, CosError> {
+        Self::open_with_stream_limit(data, password, crate::object::MAX_DECODED)
+    }
+
+    /// Open with a tighter decompression bound for object and cross-reference streams.
+    /// Inspection can use this without changing the editing reader's default limit. Such a
+    /// document is read-only: objects in a larger object stream read as missing, so the
+    /// writers refuse to save it ([`CosError::ReadOnlyLimit`]).
+    pub fn open_with_stream_limit(data: Arc<Vec<u8>>, password: Option<&str>, stream_limit: usize) -> Result<Self, CosError> {
         // Viewers accept files whose header is missing or damaged as long as the body looks
         // like PDF; so do we (a note goes to the repair log).
         let header = find(&data, b"%PDF-", 0, 1024);
@@ -176,12 +276,14 @@ impl Document {
         };
         let mut doc = Document {
             data,
+            source_identity: Arc::new(()),
             entries: Arc::new(BTreeMap::new()),
             trailer: Dict::new(),
             revisions: Arc::new(Vec::new()),
             repair_log: Arc::new(Vec::new()),
             cache: Arc::default(),
             objstms: Arc::default(),
+            stream_limit: stream_limit.min(crate::object::MAX_DECODED),
             overlay: BTreeMap::new(),
             next_num: 1,
             header_offset,
@@ -237,6 +339,8 @@ impl Document {
     }
 
     fn authenticate(&mut self, enc: &Object, password: Option<&str>) -> Result<(), CosError> {
+        // Authentication can change how the same input is decoded.
+        self.source_identity = Arc::new(());
         let (num, dict) = match enc {
             Object::Ref(r) => (Some(r.num), self.get(*r).as_dict().cloned()),
             Object::Dict(d) => (None, Some(d.clone())),
@@ -255,9 +359,9 @@ impl Document {
             Some(Object::Array(a)) => a.first().and_then(|s| s.as_string()).map(|s| s.bytes.clone()).unwrap_or_default(),
             _ => Vec::new(),
         };
-        let handler = printcraft_crypt::SecurityHandler::open(params, &id0, password).map_err(|e| match e {
-            printcraft_crypt::CryptError::WrongPassword if password.is_none() => CosError::NeedsPassword,
-            printcraft_crypt::CryptError::WrongPassword => CosError::WrongPassword,
+        let handler = pdfcraft_crypt::SecurityHandler::open(params, &id0, password).map_err(|e| match e {
+            pdfcraft_crypt::CryptError::WrongPassword if password.is_none() => CosError::NeedsPassword,
+            pdfcraft_crypt::CryptError::WrongPassword => CosError::WrongPassword,
             other => CosError::Security(other.to_string()),
         })?;
         self.security = Some(Arc::new(handler));
@@ -269,12 +373,12 @@ impl Document {
     }
 
     /// The security handler, when the document is encrypted.
-    pub fn security(&self) -> Option<&printcraft_crypt::SecurityHandler> {
+    pub fn security(&self) -> Option<&pdfcraft_crypt::SecurityHandler> {
         self.security.as_deref()
     }
 
     /// What the opening password allows (`None` for unencrypted documents: everything).
-    pub fn permissions(&self) -> Option<printcraft_crypt::Permissions> {
+    pub fn permissions(&self) -> Option<pdfcraft_crypt::Permissions> {
         self.security().map(|s| s.permissions())
     }
 
@@ -296,19 +400,19 @@ impl Document {
 
     /// The handler used to write: the new one after `set_encryption` / `remove_encryption`,
     /// otherwise the one the document was opened with.
-    pub(crate) fn output_security(&self) -> (Option<&printcraft_crypt::SecurityHandler>, Option<u32>) {
+    pub(crate) fn output_security(&self) -> (Option<&pdfcraft_crypt::SecurityHandler>, Option<u32>) {
         if self.encryption_changed { (self.out_security.as_deref(), self.out_encrypt_num) } else { (self.security.as_deref(), self.encrypt_num) }
     }
 
     /// The security the next save writes: protection applied with `set_encryption`, none after
     /// `remove_encryption`, otherwise the security the document was opened with.
-    pub fn output_handler(&self) -> Option<&printcraft_crypt::SecurityHandler> {
+    pub fn output_handler(&self) -> Option<&pdfcraft_crypt::SecurityHandler> {
         self.output_security().0
     }
 
     /// Protect the document with a password (§7.6.4). Takes effect on the next save, which is
     /// always a full rewrite. Returns the handler (authenticated as owner).
-    pub fn set_encryption(&mut self, params: &printcraft_crypt::NewEncryption) -> Result<(), CosError> {
+    pub fn set_encryption(&mut self, params: &pdfcraft_crypt::NewEncryption) -> Result<(), CosError> {
         // The file identifier is part of the key; make sure it exists and keep it.
         let id0 = match self.trailer.get(b"ID") {
             Some(Object::Array(a)) if a.len() == 2 => a[0].as_string().map(|s| s.bytes.clone()).unwrap_or_default(),
@@ -320,7 +424,7 @@ impl Document {
                 id
             }
         };
-        let h = printcraft_crypt::create(params, &id0).map_err(|e| CosError::Security(e.to_string()))?;
+        let h = pdfcraft_crypt::create(params, &id0).map_err(|e| CosError::Security(e.to_string()))?;
         let d = h.dict();
         let s = |b: &[u8]| Object::String(crate::PdfString { bytes: b.to_vec(), hex: true });
         let mut e = Dict::new();
@@ -386,6 +490,12 @@ impl Document {
 
     pub fn bytes(&self) -> &Arc<Vec<u8>> {
         &self.data
+    }
+
+    /// Identity of the original bytes, xref and authenticated decode context. Edits and
+    /// clones preserve it; reopening (including after any save) produces a new identity.
+    pub fn source_identity(&self) -> SourceIdentity {
+        SourceIdentity(Arc::downgrade(&self.source_identity))
     }
 
     pub fn version(&self) -> &str {
@@ -493,6 +603,59 @@ impl Document {
         Ok(obj)
     }
 
+    /// Visit every current object without filling this document's editing cache.
+    ///
+    /// Full-document searches (for example, standalone timestamps) need to inspect objects
+    /// that may never be used again. Keep their parse caches private and release them in
+    /// batches. Returned objects own their data and remain valid after the next batch.
+    pub fn scan_objects(&self) -> impl Iterator<Item = (ObjRef, Arc<Object>)> + use<> {
+        let numbers = self.object_numbers();
+        let mut reader = self.object_reader();
+        numbers.into_iter().map(move |num| {
+            let reference = ObjRef::new(num, reader.document.generation(num));
+            (reference, reader.get(reference))
+        })
+    }
+
+    /// Like [`Self::scan_objects`], preserving read errors for callers that must distinguish
+    /// incomplete discovery from an actual null object. Caches remain private and bounded.
+    pub fn scan_objects_checked(&self) -> impl Iterator<Item = (ObjRef, Result<Arc<Object>, CosError>)> + use<> {
+        self.scan_objects_subset(self.object_numbers())
+    }
+
+    /// Inspect selected current objects with the same bounded cache as a whole-file scan.
+    /// Missing/freed numbers yield `Null`; malformed objects return their read error.
+    pub fn scan_objects_subset(&self, numbers: Vec<u32>) -> impl Iterator<Item = (ObjRef, Result<Arc<Object>, CosError>)> + use<> {
+        let mut reader = self.object_reader();
+        numbers.into_iter().map(move |num| {
+            let reference = ObjRef::new(num, reader.document.generation(num));
+            (reference, reader.try_get(reference))
+        })
+    }
+
+    /// Inspect selected objects in the immutable source, ignoring all unsaved edits. This
+    /// allows a consumer to check an edit's dependencies without retaining an old document.
+    pub fn scan_original_objects_subset(&self, numbers: Vec<u32>) -> impl Iterator<Item = (ObjRef, Result<Arc<Object>, CosError>)> + use<> {
+        let mut reader = self.object_reader();
+        reader.document.overlay.clear();
+        numbers.into_iter().map(move |num| {
+            let reference = ObjRef::new(num, reader.document.generation(num));
+            (reference, reader.try_get(reference))
+        })
+    }
+
+    /// Opened with a tighter stream limit than editing uses ([`Document::open_with_stream_limit`]).
+    pub(crate) fn stream_limited(&self) -> bool {
+        self.stream_limit < crate::object::MAX_DECODED
+    }
+
+    pub(crate) fn object_reader(&self) -> ObjectReader {
+        let mut document = self.clone();
+        document.cache = Arc::default();
+        document.objstms = Arc::default();
+        ObjectReader { document, decoded_count: 0 }
+    }
+
     fn load(&self, num: u32, depth: u32) -> Result<Object, CosError> {
         if depth > 16 {
             return Err(CosError::Syntax { offset: 0, detail: "reference cycle while loading".into() });
@@ -509,7 +672,7 @@ impl Document {
                     length
                 };
                 let off = *offset as usize;
-                let at = |off: usize| match parse_indirect(&self.data, off, &resolve) {
+                let at = |off: usize| match parse_indirect_shared(&self.data, off, &resolve) {
                     Ok((id, o)) if id.num == num => Some(self.decrypted(id, o)),
                     _ => None,
                 };
@@ -541,7 +704,7 @@ impl Document {
         let Object::Stream(s) = &*self.try_get(num)? else { return Err(CosError::MissingObject(num)) };
         let n = s.dict.int(b"N").unwrap_or(0).clamp(0, 1_000_000) as usize;
         let first = s.dict.int(b"First").unwrap_or(0).max(0) as usize;
-        let data = s.decoded()?;
+        let data = s.decoded_within(self.stream_limit)?;
         let mut lx = Lexer::new(&data, 0);
         let mut index = Vec::with_capacity(n);
         for _ in 0..n {
@@ -564,7 +727,7 @@ impl Document {
             if p > 0 && !is_whitespace(data[p - 1]) {
                 continue;
             }
-            if let Ok((id, o)) = parse_indirect(data, p, &|_| None)
+            if let Ok((id, o)) = parse_indirect_shared(data, p, &|_| None)
                 && id.num == num
             {
                 found = Some((id, o)); // keep the last (newest) definition
@@ -575,9 +738,22 @@ impl Document {
 
     // ── editing ─────────────────────────────────────────────────────────────────────────────
 
+    /// Stream data still pointing into another document's file would keep that whole file
+    /// alive for as long as this edit exists: give it a buffer of its own (just its bytes).
+    fn adopt(&self, obj: Object) -> Object {
+        match obj {
+            Object::Stream(mut s) if s.raw.borrows_other_than(&self.data) => {
+                s.raw = s.raw.detached();
+                Object::Stream(s)
+            }
+            other => other,
+        }
+    }
+
     /// Replace an object (keeping its generation).
     pub fn set(&mut self, r: ObjRef, obj: impl Into<Object>) {
-        self.overlay.insert(r.num, Slot::Set(r.generation, Arc::new(obj.into())));
+        let obj = self.adopt(obj.into());
+        self.overlay.insert(r.num, Slot::Set(r.generation, Arc::new(obj)));
         if r.num >= self.next_num {
             self.next_num = r.num + 1;
         }
@@ -587,7 +763,8 @@ impl Document {
     pub fn add(&mut self, obj: impl Into<Object>) -> ObjRef {
         let r = ObjRef::new(self.next_num, 0);
         self.next_num += 1;
-        self.overlay.insert(r.num, Slot::Set(0, Arc::new(obj.into())));
+        let obj = self.adopt(obj.into());
+        self.overlay.insert(r.num, Slot::Set(0, Arc::new(obj)));
         r
     }
 
@@ -631,16 +808,27 @@ impl Document {
 
     /// All object numbers known (file and overlay), excluding freed ones.
     pub fn object_numbers(&self) -> Vec<u32> {
-        let mut set: HashSet<u32> = self.entries.iter().filter(|(_, e)| !matches!(e, XrefEntry::Free { .. })).map(|(n, _)| *n).collect();
-        for (n, s) in &self.overlay {
-            match s {
-                Slot::Set(..) => set.insert(*n),
-                Slot::Freed(_) => set.remove(n),
-            };
+        // Both maps are ordered. Overlay slots replace source slots, including frees;
+        // merge them directly without a second set and a sort of every object number.
+        let mut numbers = Vec::with_capacity(self.entries.len().max(self.overlay.len()));
+        let mut source = self.entries.iter().peekable();
+        for (&num, slot) in &self.overlay {
+            while source.peek().is_some_and(|(n, _)| **n < num) {
+                if let Some((&n, entry)) = source.next()
+                    && !matches!(entry, XrefEntry::Free { .. })
+                {
+                    numbers.push(n);
+                }
+            }
+            if source.peek().is_some_and(|(n, _)| **n == num) {
+                source.next();
+            }
+            if matches!(slot, Slot::Set(..)) {
+                numbers.push(num);
+            }
         }
-        let mut v: Vec<u32> = set.into_iter().collect();
-        v.sort_unstable();
-        v
+        numbers.extend(source.filter_map(|(&num, entry)| (!matches!(entry, XrefEntry::Free { .. })).then_some(num)));
+        numbers
     }
 
     /// Rebase this document on bytes written by the writer (after a save): edits become part of
@@ -740,8 +928,8 @@ impl Document {
                 let (Ok(Object::Int(start)), Ok(Object::Int(count))) = (lx.object(), lx.object()) else {
                     return Err(CosError::Syntax { offset: lx.pos, detail: "bad xref subsection header".into() });
                 };
-                if start < 0 || !(0..=10_000_000).contains(&count) {
-                    return Err(CosError::Syntax { offset: lx.pos, detail: "implausible xref subsection".into() });
+                if !valid_xref_range(start, count) || count > 10_000_000 {
+                    return Err(CosError::Syntax { offset: lx.pos, detail: "invalid xref object range".into() });
                 }
                 for i in 0..count {
                     lx.skip_ws();
@@ -793,7 +981,7 @@ impl Document {
         // One row per object, and a document has at most 8,388,607 indirect objects (the classic
         // implementation limit): decoding more than that (about 200 MB at the widest rows) is a
         // decompression bomb, not cross-reference data. The section is then reconstructed.
-        let raw = s.decoded_within(MAX_XREF_OBJECTS.saturating_mul(row))?;
+        let raw = s.decoded_within(MAX_XREF_OBJECTS.saturating_mul(row).min(self.stream_limit))?;
         let field = |r: &[u8], from: usize, len: usize, default: u64| -> u64 {
             if len == 0 {
                 return default;
@@ -803,12 +991,15 @@ impl Document {
         let mut rows = raw.chunks_exact(row);
         for pair in index.chunks(2) {
             let [start, count] = pair else { break };
-            for i in 0..(*count).max(0) {
+            if !valid_xref_range(*start, *count) {
+                return Err(CosError::Syntax { offset: off, detail: "invalid xref object range".into() });
+            }
+            for i in 0..*count {
                 let Some(r) = rows.next() else { break };
                 let t = field(r, 0, w[0], 1);
                 let a = field(r, w[0], w[1], 0);
                 let b = field(r, w[0] + w[1], w[2], 0);
-                let num = (*start + i).max(0) as u32;
+                let num = (*start + i) as u32;
                 let entry = match t {
                     0 => XrefEntry::Free { next_generation: b.min(u16::MAX as u64) as u16 },
                     1 => XrefEntry::InFile { offset: a, generation: b.min(u16::MAX as u64) as u16 },
@@ -928,10 +1119,17 @@ fn generated_id(seed: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::new();
     for i in 0..2u8 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (seed, i, b"printcraft id").hash(&mut h);
+        (seed, i, b"pdfcraft id").hash(&mut h);
         out.extend_from_slice(&h.finish().to_be_bytes());
     }
     out
+}
+
+/// Object numbers must fit the representation used by references and the xref map.
+/// Validate the whole subsection before adding entries, so neither arithmetic overflow nor
+/// truncation can turn a damaged range into entries for unrelated objects.
+fn valid_xref_range(start: i64, count: i64) -> bool {
+    u32::try_from(start).is_ok() && count >= 0 && start.checked_add(count).is_some_and(|end| end <= i64::from(u32::MAX) + 1)
 }
 
 /// The most indirect objects a document can have (the classic implementation limit, ISO
@@ -960,6 +1158,37 @@ mod tests {
     }
 
     #[test]
+    fn invalid_xref_object_ranges_are_reconstructed() {
+        // Original in-memory PDF: an intact catalog followed by a damaged xref section.
+        for stream in [false, true] {
+            for (start, count) in [(i64::MAX, 2), (-1, 2), (4_294_967_296, 1), (4_294_967_295, 2)] {
+                let mut bytes =
+                    b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n".to_vec();
+                let offset = bytes.len();
+                if stream {
+                    bytes.extend_from_slice(
+                        format!("3 0 obj\n<< /Type /XRef /Root 1 0 R /Size 4 /W [1 1 1] /Index [{start} {count}] /Length 6 >>\nstream\n").as_bytes(),
+                    );
+                    bytes.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+                    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+                } else {
+                    bytes.extend_from_slice(
+                        format!("xref\n{start} {count}\n0000000000 65535 f \n0000000000 65535 f \ntrailer\n<< /Root 1 0 R /Size 3 >>\n").as_bytes(),
+                    );
+                }
+                bytes.extend_from_slice(format!("startxref\n{offset}\n%%EOF\n").as_bytes());
+                let doc = Document::open(Arc::new(bytes)).unwrap();
+                assert!(
+                    doc.repair_log().iter().any(|line| line.contains("xref") && line.contains("range")),
+                    "stream={stream}, start={start}, count={count}: {:?}",
+                    doc.repair_log()
+                );
+                assert_eq!(doc.get(ObjRef::new(1, 0)).as_dict().unwrap().name(b"Type"), Some(b"Catalog".as_slice()));
+            }
+        }
+    }
+
+    #[test]
     fn self_referential_length_does_not_overflow() {
         let bytes = build(
             &["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [] /Count 0 >>", "<< /Length 3 0 R >>\nstream\nabc\nendstream"],
@@ -969,7 +1198,7 @@ mod tests {
         // Either recovered via the endstream search or reported — but never a stack overflow.
         let o = doc.get(ObjRef::new(3, 0));
         if let Object::Stream(s) = o.as_ref() {
-            assert_eq!(s.raw.as_slice(), b"abc");
+            assert_eq!(&s.raw[..], b"abc");
         }
     }
 
@@ -999,6 +1228,150 @@ mod tests {
         edited.update_dict(ObjRef::new(1, 0), |d| d.set(b"Lang".to_vec(), Object::String(crate::PdfString::literal("en")))).unwrap();
         assert!(edited.is_modified() && !doc.is_modified(), "clone is an independent snapshot");
         assert!(doc.get(ObjRef::new(1, 0)).as_dict().unwrap().get(b"Lang").is_none());
+    }
+
+    #[test]
+    fn object_numbers_merge_source_and_overlay_in_order() {
+        let mut doc = Document::new_empty();
+        doc.overlay.clear();
+        doc.entries = Arc::new(BTreeMap::from([
+            (0, XrefEntry::Free { next_generation: 65535 }),
+            (2, XrefEntry::InFile { offset: 10, generation: 7 }),
+            (4, XrefEntry::Free { next_generation: 9 }),
+            (6, XrefEntry::InStream { stream: 80, index: 1 }),
+            (8, XrefEntry::InFile { offset: 20, generation: 5 }),
+            (10, XrefEntry::InFile { offset: 30, generation: 3 }),
+            (u32::MAX, XrefEntry::InFile { offset: 40, generation: 1 }),
+        ]));
+        doc.set(ObjRef::new(1, 2), Object::Int(1)); // before the first live source slot
+        doc.set(ObjRef::new(2, 8), Object::Int(2)); // override, without duplication
+        doc.set(ObjRef::new(4, 9), Object::Int(4)); // reuse a source free slot
+        doc.free(ObjRef::new(6, 0)); // remove a compressed source object
+        doc.free(ObjRef::new(7, 2)); // free a number absent from the source
+        doc.free(ObjRef::new(10, 3));
+        doc.set(ObjRef::new(11, 4), Object::Int(11));
+        assert_eq!(doc.object_numbers(), vec![1, 2, 4, 8, 11, u32::MAX]);
+        assert_eq!(doc.generation(2), 8);
+        assert_eq!(doc.generation(4), 9);
+        assert_eq!(doc.generation(6), 1);
+        assert_eq!(doc.generation(8), 5);
+        assert_eq!(doc.generation(10), 4);
+        doc.overlay.clear();
+        assert_eq!(doc.object_numbers(), vec![2, 6, 8, 10, u32::MAX]);
+        doc.entries = Arc::default();
+        assert!(doc.object_numbers().is_empty());
+        doc.set(ObjRef::new(5, 7), Object::Int(5));
+        assert_eq!(doc.object_numbers(), vec![5]);
+    }
+
+    #[test]
+    fn full_object_scans_preserve_edits_without_retaining_the_scan() {
+        let mut bodies = vec!["<< /Type /Catalog /Pages 2 0 R >>".to_owned(), "<< /Type /Pages /Kids [] /Count 0 >>".to_owned()];
+        bodies.extend((0..400).map(|i| format!("<< /Value {i} >>")));
+        let refs: Vec<_> = bodies.iter().map(String::as_str).collect();
+        let mut doc = Document::open(Arc::new(build(&refs, "/Root 1 0 R"))).unwrap();
+        doc.set(ObjRef::new(3, 0), Object::Int(900));
+        doc.free(ObjRef::new(4, 0));
+        let added = doc.add(Object::Int(901));
+        let cached = doc.cache.lock().unwrap().len();
+        let held: Vec<_> = doc.scan_objects().collect();
+        assert_eq!(held.len(), 402);
+        assert_eq!(doc.cache.lock().unwrap().len(), cached, "scanning must not populate the editor cache");
+        assert!(doc.objstms.lock().unwrap().is_empty());
+        assert!(!held.iter().any(|(r, _)| r.num == 4));
+        assert_eq!(held.iter().find(|(r, _)| r.num == 3).unwrap().1.as_int(), Some(900));
+        assert_eq!(held.iter().find(|(r, _)| *r == added).unwrap().1.as_int(), Some(901));
+        assert_eq!(held.iter().find(|(r, _)| r.num == 400).unwrap().1.as_dict().unwrap().int(b"Value"), Some(397));
+        // Previously returned objects survive cache eviction and dropping the source.
+        drop(doc);
+        assert_eq!(held.iter().find(|(r, _)| r.num == 128).unwrap().1.as_dict().unwrap().int(b"Value"), Some(125));
+    }
+
+    #[test]
+    fn temporary_reader_keeps_file_views_and_evicts_data_of_its_own() {
+        // A stream read from the file is a view into the input: caching it costs no copy, so
+        // even a large one stays cached (its /Length object too) instead of being re-parsed.
+        let body = "x".repeat(ObjectReader::STREAM_BYTES + 1);
+        let stream = format!("<< /Length 4 0 R >>\nstream\n{body}\nendstream");
+        let length = body.len().to_string();
+        let bytes = build(&["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [] /Count 0 >>", &stream, &length], "/Root 1 0 R");
+        let doc = Document::open(Arc::new(bytes)).unwrap();
+        let mut reader = doc.object_reader();
+        let read = reader.get(ObjRef::new(3, 0));
+        let Object::Stream(s) = &*read else { panic!("stream") };
+        assert!(s.raw.shares(&reader.document.data), "no copy of the file's bytes");
+        assert!(reader.document.cache.lock().unwrap().contains_key(&3), "a view costs nothing to keep");
+        // Data of its own (decrypted streams, strings) counts: past the budget the cache is
+        // cleared after the next read, including a failed one.
+        let owned = Object::Stream(crate::Stream::from_raw(Dict::new(), vec![b'y'; ObjectReader::STREAM_BYTES + 1]));
+        reader.document.cache.lock().unwrap().insert(3, Arc::new(owned));
+        assert_eq!(*reader.get(ObjRef::new(99, 0)), Object::Null);
+        assert!(reader.document.cache.lock().unwrap().is_empty(), "owned data over budget is evicted");
+    }
+
+    #[test]
+    fn temporary_reader_and_full_save_do_not_fill_snapshot_caches() {
+        let mut source = Document::new_empty();
+        let objects: Vec<_> = (0..260)
+            .map(|i| {
+                let mut value = vec![b'x'; 48 * 1024];
+                value[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                Object::Ref(source.add(Object::String(crate::PdfString::literal(value))))
+            })
+            .collect();
+        source.update_dict(source.root().unwrap(), |d| d.set(b"Extension".to_vec(), Object::Array(objects))).unwrap();
+        let bytes = Arc::new(crate::write_full(&source, &crate::SaveOptions::default()).unwrap());
+        let doc = Document::open(bytes).unwrap();
+        let root = doc.get(doc.root().unwrap());
+        let references = root.as_dict().unwrap().get(b"Extension").unwrap().as_array().unwrap();
+        let snapshot = doc.clone();
+        let cached = doc.cache.lock().unwrap().len();
+        let streams = doc.objstms.lock().unwrap().len();
+        let mut reader = doc.object_reader();
+        let mut held = None;
+        for (i, reference) in references.iter().enumerate() {
+            let Object::Ref(reference) = reference else { panic!("indirect object") };
+            let object = reader.get(*reference);
+            assert_eq!(&object.as_string().unwrap().bytes[..4], &(i as u32).to_le_bytes());
+            if i == 0 {
+                held = Some(object);
+            }
+            assert!(reader.document.cache.lock().unwrap().len() < ObjectReader::OBJECTS);
+            let decoded = reader.document.objstms.lock().unwrap();
+            assert!(decoded.len() < ObjectReader::OBJECTS);
+            let bytes: usize = decoded.values().map(|s| s.data.capacity() + s.index.capacity() * std::mem::size_of::<(u32, usize)>()).sum();
+            assert!(bytes <= ObjectReader::STREAM_BYTES || decoded.len() == 1, "only one oversized stream may remain");
+        }
+        drop(reader);
+        assert_eq!(&held.unwrap().as_string().unwrap().bytes[..4], &0u32.to_le_bytes(), "owned results survive evictions");
+        for object_streams in [false, true] {
+            let saved = crate::write_full(&doc, &crate::SaveOptions { object_streams, ..Default::default() }).unwrap();
+            assert!(Document::open(Arc::new(saved)).unwrap().repair_log().is_empty());
+            assert_eq!(doc.cache.lock().unwrap().len(), cached, "full saves must not fill the editor cache");
+            assert_eq!(doc.objstms.lock().unwrap().len(), streams);
+            assert!(Arc::ptr_eq(&doc.cache, &snapshot.cache), "do not detach or clear caller snapshots");
+        }
+    }
+
+    #[test]
+    fn a_stream_limited_document_cannot_be_saved() {
+        let bytes = Arc::new(crate::write_full(&Document::new_empty(), &crate::SaveOptions::default()).unwrap());
+        let doc = Document::open_with_stream_limit(bytes.clone(), None, 1 << 20).unwrap();
+        for saved in [crate::write_full(&doc, &crate::SaveOptions::default()), crate::write_incremental(&doc, &crate::SaveOptions::default())] {
+            assert!(matches!(saved, Err(CosError::ReadOnlyLimit)), "{saved:?}");
+        }
+        let doc = Document::open(bytes).unwrap();
+        assert!(crate::write_full(&doc, &crate::SaveOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn inspection_stream_limit_applies_before_loading_compressed_objects() {
+        let mut doc = Document::new_empty();
+        let large = doc.add(Object::String(crate::PdfString::literal(vec![b'x'; 4096])));
+        doc.update_dict(doc.root().unwrap(), |catalog| catalog.set(b"Extension".to_vec(), Object::Ref(large))).unwrap();
+        let bytes = Arc::new(crate::write_full(&doc, &crate::SaveOptions::default()).unwrap());
+        assert!(Document::open(bytes.clone()).is_ok());
+        assert!(Document::open_with_stream_limit(bytes, None, 512).is_err());
     }
 
     /// A /Prev chain that loops back on itself stops at the loop (and says so).
@@ -1087,7 +1460,7 @@ mod tests {
         // /W [1 1 1]: at 3 bytes a row that is more than 8,388,607 objects' worth, so it is not
         // decoded (in full: the limit applies while inflating) and the objects are found by
         // reconstruction instead.
-        let bomb = printcraft_filters::encode_flate(&printcraft_filters::encode_flate(&vec![0u8; 32 << 20]));
+        let bomb = pdfcraft_filters::encode_flate(&pdfcraft_filters::encode_flate(&vec![0u8; 32 << 20]));
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let o1 = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");

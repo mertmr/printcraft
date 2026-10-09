@@ -4,8 +4,8 @@
 use egui::{Pos2, pos2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use printcraft_render::Annotation;
-use printcraft_ui_egui::{PrintCraftApp, QuickTool};
+use pdfcraft_render::Annotation;
+use pdfcraft_ui_egui::{PdfCraftApp, QuickTool};
 
 /// Two 300×200 pages of Helvetica text.
 const TEXT_FIXTURE: &[u8] = b"%PDF-1.7
@@ -23,9 +23,10 @@ endstream endobj
 trailer << /Root 1 0 R >>
 %%EOF";
 
-fn harness(setup: impl FnOnce(&mut PrintCraftApp) + 'static) -> Harness<'static, PrintCraftApp> {
+fn harness(setup: impl FnOnce(&mut PdfCraftApp) + 'static) -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
-        let mut app = PrintCraftApp::new();
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("text.pdf", None, TEXT_FIXTURE.to_vec()).expect("opens");
         app.set_option("left", "closed").unwrap();
         app.set_option("author", "Tester").unwrap();
@@ -37,7 +38,7 @@ fn harness(setup: impl FnOnce(&mut PrintCraftApp) + 'static) -> Harness<'static,
     h
 }
 
-fn settle(h: &mut Harness<'static, PrintCraftApp>) {
+fn settle(h: &mut Harness<'static, PdfCraftApp>) {
     for _ in 0..200 {
         h.run_steps(2);
         if !h.state().render_pending() {
@@ -48,12 +49,12 @@ fn settle(h: &mut Harness<'static, PrintCraftApp>) {
 }
 
 /// A point on page 1 in PDF user space → screen (no rotation; MediaBox 300×200).
-fn at(h: &Harness<'static, PrintCraftApp>, x: f32, y: f32) -> Pos2 {
+fn at(h: &Harness<'static, PdfCraftApp>, x: f32, y: f32) -> Pos2 {
     let r = h.state().views[0].page_screen_rect(0).expect("page 1 on screen");
     pos2(r.left() + x / 300.0 * r.width(), r.top() + (200.0 - y) / 200.0 * r.height())
 }
 
-fn drag(h: &mut Harness<'static, PrintCraftApp>, from: Pos2, to: Pos2) {
+fn drag(h: &mut Harness<'static, PdfCraftApp>, from: Pos2, to: Pos2) {
     h.hover_at(from);
     h.run_steps(1);
     h.drag_at(from);
@@ -66,7 +67,7 @@ fn drag(h: &mut Harness<'static, PrintCraftApp>, from: Pos2, to: Pos2) {
     h.run_steps(3);
 }
 
-fn click(h: &mut Harness<'static, PrintCraftApp>, p: Pos2) {
+fn click(h: &mut Harness<'static, PdfCraftApp>, p: Pos2) {
     h.hover_at(p);
     h.run_steps(1);
     h.drag_at(p);
@@ -76,23 +77,23 @@ fn click(h: &mut Harness<'static, PrintCraftApp>, p: Pos2) {
 }
 
 /// Drag between two page points (user space).
-fn drag_pt(h: &mut Harness<'static, PrintCraftApp>, a: (f32, f32), b: (f32, f32)) {
+fn drag_pt(h: &mut Harness<'static, PdfCraftApp>, a: (f32, f32), b: (f32, f32)) {
     let (a, b) = (at(h, a.0, a.1), at(h, b.0, b.1));
     drag(h, a, b);
 }
 
 /// Click a page point (user space).
-fn click_pt(h: &mut Harness<'static, PrintCraftApp>, p: (f32, f32)) {
+fn click_pt(h: &mut Harness<'static, PdfCraftApp>, p: (f32, f32)) {
     let p = at(h, p.0, p.1);
     click(h, p);
 }
 
 /// A text field by its placeholder ("Add a comment", "Add a reply").
-fn field<'a>(h: &'a Harness<'static, PrintCraftApp>, placeholder: &'a str) -> egui_kittest::Node<'a> {
+fn field<'a>(h: &'a Harness<'static, PdfCraftApp>, placeholder: &'a str) -> egui_kittest::Node<'a> {
     h.query_all_by(|n| n.placeholder() == Some(placeholder)).next().unwrap_or_else(|| panic!("no field {placeholder:?}"))
 }
 
-fn comments(h: &Harness<'static, PrintCraftApp>) -> Vec<Annotation> {
+fn comments(h: &Harness<'static, PdfCraftApp>) -> Vec<Annotation> {
     let s = h.state();
     s.session.get(s.views[0].id).unwrap().info.annotations.clone()
 }
@@ -109,10 +110,33 @@ fn dragging_over_text_with_the_highlighter_highlights_it() {
     assert_eq!(c.len(), 1, "{c:?}");
     assert_eq!((c[0].subtype.as_str(), c[0].author.as_deref(), c[0].quads.len()), ("Highlight", Some("Tester"), 1));
     assert_eq!(h.state().views[0].comments.selected, Some((0, 0)), "the new comment is selected");
-    assert_eq!(h.state().quick_tool, QuickTool::Comment(printcraft_ui_egui::comments::CommentTool::Highlight), "the highlighter stays on");
+    assert_eq!(h.state().quick_tool, QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::Highlight), "the highlighter stays on");
     // The Comments panel opened with the tool and lists it.
     h.get_by_label_contains("Comments");
     assert_eq!(h.state().session.get(h.state().views[0].id).unwrap().can_undo(), Some("Add highlight"));
+}
+
+#[test]
+fn a_new_highlight_opens_its_note_for_typing() {
+    let mut h = harness(|app| app.set_option("quick", "highlight").unwrap());
+    assert_eq!(h.state().views[0].comments.editing, None);
+    let (a, b) = {
+        let v = &h.state().views[0];
+        (v.glyph_screen_pos(0, 4).expect("text layer"), v.glyph_screen_pos(0, 14).expect("glyph"))
+    };
+    drag(&mut h, a, b);
+    assert_eq!(comments(&h).len(), 1);
+    assert_eq!(h.state().views[0].comments.editing, Some((0, 0, String::new())), "the Comments panel edits the new highlight");
+    // An area highlight opens its note too, replacing the empty one.
+    drag_pt(&mut h, (40.0, 100.0), (140.0, 40.0));
+    assert_eq!(comments(&h).len(), 2);
+    assert_eq!(h.state().views[0].comments.editing, Some((0, 1, String::new())));
+    // A note being typed is kept: the next highlight is only selected.
+    h.state_mut().views[0].comments.editing = Some((0, 1, "typed".into()));
+    drag_pt(&mut h, (160.0, 100.0), (260.0, 40.0));
+    assert_eq!(comments(&h).len(), 3);
+    assert_eq!(h.state().views[0].comments.selected, Some((0, 2)));
+    assert_eq!(h.state().views[0].comments.editing, Some((0, 1, "typed".into())));
 }
 
 #[test]
@@ -145,6 +169,30 @@ fn shapes_and_ink_are_drawn_by_dragging() {
     assert_eq!(kinds, ["Square", "Ink", "Line"], "{c:?}");
     let r = c[0].rect;
     assert!((r[0] - 40.0).abs() < 3.0 && (r[1] - 40.0).abs() < 3.0 && (r[2] - 140.0).abs() < 3.0 && (r[3] - 100.0).abs() < 3.0, "{r:?}");
+}
+
+#[test]
+fn pen_strokes_stay_unselected_so_writing_continues() {
+    let mut h = harness(|app| app.set_option("quick", "ink").unwrap());
+    // No Comments panel: the author's name should only show in a hover popup.
+    h.state_mut().set_option("panel", "none").unwrap();
+    h.run_steps(2);
+    drag_pt(&mut h, (40.0, 100.0), (140.0, 60.0));
+    assert_eq!(h.state().views[0].comments.selected, None, "the first stroke isn't selected");
+    // The pointer still rests on the stroke: no author popup covers it.
+    h.hover_at(at(&h, 140.0, 60.0));
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Tester").is_none(), "no author popup while drawing");
+    drag_pt(&mut h, (60.0, 100.0), (160.0, 60.0));
+    let c = comments(&h);
+    let kinds: Vec<&str> = c.iter().map(|a| a.subtype.as_str()).collect();
+    assert_eq!(kinds, ["Ink", "Ink"], "{c:?}");
+    assert_eq!(h.state().views[0].comments.selected, None, "nothing is selected after drawing");
+    assert_eq!(h.state().quick_tool, QuickTool::Comment(pdfcraft_ui_egui::comments::CommentTool::Ink), "the pen stays on");
+    // Other drawn shapes are still selected when made.
+    h.state_mut().set_option("quick", "square").unwrap();
+    drag_pt(&mut h, (180.0, 100.0), (260.0, 40.0));
+    assert_eq!(h.state().views[0].comments.selected, Some((0, 2)));
 }
 
 #[test]
@@ -217,6 +265,37 @@ fn the_panel_posts_comments_and_replies() {
 }
 
 #[test]
+fn line_ending_properties_change_and_undo() {
+    let mut h = harness(|app| app.set_option("quick", "line").unwrap());
+    drag_pt(&mut h, (40.0, 100.0), (160.0, 40.0));
+    h.state_mut().open_comment_props(0, 0);
+    h.run_steps(2);
+    h.get_by_label("Line ending");
+    {
+        let d = h.state_mut().comment_props.as_mut().expect("open");
+        assert_eq!(d.edited.endings.as_deref(), Some(&[pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::None][..]));
+        d.edited.endings = Some(vec![pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::Diamond]);
+    }
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let endings = {
+        let s = h.state();
+        let doc = s.session.get(s.views[0].id).unwrap();
+        assert_eq!(doc.can_undo(), Some("Change comment properties"));
+        doc.comment_props(0, 0).unwrap().endings
+    };
+    assert_eq!(endings.as_deref(), Some(&[pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::Diamond][..]));
+    h.state_mut().execute("edit.undo");
+    h.run_steps(2);
+    let s = h.state();
+    let doc = s.session.get(s.views[0].id).unwrap();
+    assert_eq!(
+        doc.comment_props(0, 0).unwrap().endings.as_deref(),
+        Some(&[pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::None][..])
+    );
+}
+
+#[test]
 fn comment_properties_change_appearance_and_author() {
     let mut h = harness(|app| app.set_option("quick", "square").unwrap());
     drag_pt(&mut h, (40.0, 100.0), (140.0, 40.0));
@@ -260,7 +339,7 @@ fn the_panel_filters_and_sorts() {
     assert_eq!(h.query_all_by_label("Oval").count(), ovals - 1, "the oval's card is filtered out");
     assert!(h.query_all_by_label("Rectangle").count() >= 1);
     h.state_mut().views[0].comments.hidden_types.clear();
-    h.state_mut().views[0].comments.sort = printcraft_ui_egui::comments::SortBy::Type;
+    h.state_mut().views[0].comments.sort = pdfcraft_ui_egui::comments::SortBy::Type;
     h.run_steps(2);
     // Grouped by type: a group header names each type.
     assert_eq!(h.query_all_by_label("Oval").count(), ovals + 1, "a group header was added");
@@ -283,7 +362,7 @@ fn comments_take_checkmarks_lock_hide_and_summarize() {
     h.get_by_label("Remove checkmark");
 
     // "…" ▸ Copy text puts the comment's text on the clipboard.
-    h.state_mut().apply_edit(printcraft_engine::Edit::SetAnnotationContents { page: 0, index: 0, text: "Copy me".into() });
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::SetAnnotationContents { page: 0, index: 0, text: "Copy me".into() });
     h.run_steps(2);
     h.get_by_label("More").click();
     h.run_steps(2);
@@ -399,16 +478,17 @@ fn the_panel_filters_by_colour_and_checkmark() {
     h.state_mut().set_option("quick", "circle").unwrap();
     drag_pt(&mut h, (160.0, 100.0), (260.0, 40.0));
     h.state_mut().set_option("quick", "select").unwrap();
-    h.state_mut().apply_edit(printcraft_engine::Edit::StyleAnnotation {
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::StyleAnnotation {
         page: 0,
         index: 1,
         color: Some([0.0, 0.47, 0.84]),
         opacity: None,
         width: None,
+        endings: None,
     });
-    h.state_mut().apply_edit(printcraft_engine::Edit::MarkAnnotation { page: 0, index: 0, marked: true, author: "Tester".into() });
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::MarkAnnotation { page: 0, index: 0, marked: true, author: "Tester".into() });
     h.run_steps(2);
-    let cards = |h: &Harness<'static, PrintCraftApp>| (h.query_all_by_label("Rectangle").count(), h.query_all_by_label("Oval").count());
+    let cards = |h: &Harness<'static, PdfCraftApp>| (h.query_all_by_label("Rectangle").count(), h.query_all_by_label("Oval").count());
     // The filter menu lists the colours by name (counted with it open: it names the types too).
     h.get_by_label("Filter comments").click();
     h.run_steps(2);
@@ -433,19 +513,20 @@ fn make_current_properties_default() {
     });
     drag_pt(&mut h, (40.0, 100.0), (140.0, 40.0));
     h.state_mut().set_option("quick", "select").unwrap();
-    h.state_mut().apply_edit(printcraft_engine::Edit::StyleAnnotation {
+    h.state_mut().apply_edit(pdfcraft_engine::Edit::StyleAnnotation {
         page: 0,
         index: 0,
         color: Some([0.0, 0.47, 0.84]),
         opacity: Some(0.5),
         width: Some(5.0),
+        endings: None,
     });
     h.run_steps(2);
     h.get_by_label("More").click();
     h.run_steps(2);
     h.get_by_label("Make Current Properties Default").click();
     h.run_steps(3);
-    let st = h.state().comment_prefs.style(printcraft_ui_egui::comments::CommentTool::Rectangle);
+    let st = h.state().comment_prefs.style(pdfcraft_ui_egui::comments::CommentTool::Rectangle);
     assert_eq!((st.color, st.opacity, st.width), ([0.0, 0.47, 0.84], 0.5, 5.0));
     // The next rectangle takes it.
     h.state_mut().set_option("quick", "square").unwrap();
@@ -513,6 +594,52 @@ fn attaching_a_file_as_a_comment() {
     assert_eq!(s.quick_tool, QuickTool::Select);
 }
 
+/// Drag with the middle button (the mouse wheel) in small steps.
+fn middle_drag(h: &mut Harness<'static, PdfCraftApp>, from: Pos2, to: Pos2) {
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Middle, pressed, modifiers: egui::Modifiers::NONE };
+    h.event(egui::Event::PointerMoved(from));
+    h.run_steps(1);
+    h.event(button(from, true));
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.event(egui::Event::PointerMoved(from + (to - from) * (k as f32 / 4.0)));
+        h.run_steps(1);
+    }
+    h.event(button(to, false));
+    h.run_steps(3);
+}
+
+#[test]
+fn a_middle_drag_with_a_drawing_tool_scrolls_instead_of_drawing() {
+    // egui's drag responses accept any button, so the drawing tools used to draw with the wheel.
+    let mut h = harness(|app| {
+        app.set_option("zoom", "400").unwrap();
+        app.set_option("quick", "ink").unwrap();
+    });
+    let from = at(&h, 150.0, 100.0);
+    let top = h.state().views[0].page_screen_rect(0).expect("page 1 on screen").top();
+    middle_drag(&mut h, from, from - egui::vec2(0.0, 120.0));
+    assert!(comments(&h).is_empty(), "{:?}", comments(&h));
+    let s = h.state();
+    assert!(!s.session.get(s.views[0].id).unwrap().dirty, "scrolling never edits the PDF");
+    assert!(!s.views[0].middle_panning(), "releasing the wheel ends the pan");
+    let moved = s.views[0].page_screen_rect(0).expect("page 1 on screen").top();
+    if cfg!(target_os = "linux") {
+        // Linux latches auto-scroll instead of panning with the drag.
+        assert!(s.views[0].auto_scrolling());
+    } else {
+        assert!((moved - (top - 120.0)).abs() < 1.0, "the page follows the pointer: {top} -> {moved}");
+    }
+    // The tool still draws with the primary button afterwards.
+    if cfg!(target_os = "linux") {
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+    drag_pt(&mut h, (60.0, 120.0), (200.0, 80.0));
+    let kinds: Vec<String> = comments(&h).into_iter().map(|a| a.subtype).collect();
+    assert_eq!(kinds, ["Ink"]);
+}
+
 #[test]
 fn erasing_part_of_a_drawing() {
     let mut h = harness(|app| app.set_option("quick", "ink").unwrap());
@@ -538,7 +665,8 @@ fn hovering_a_comment_shows_its_author_and_text() {
         "8 0 obj << /Type /Annot /Subtype /Square /Rect [50 50 150 120] /C [1 0 0] /T (Ada) /Contents (Check this figure) >> endobj\ntrailer",
     );
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
-        let mut app = PrintCraftApp::new();
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("hover.pdf", None, pdf.into_bytes()).expect("opens");
         app.set_option("left", "closed").unwrap();
         // No Comments panel: the comment's text should only appear in the hover popup.
@@ -565,13 +693,13 @@ fn the_squiggly_tool_marks_selected_text() {
     assert_eq!(c.len(), 1, "{c:?}");
     assert_eq!((c[0].subtype.as_str(), c[0].quads.len()), ("Squiggly", 1));
     // It sits with the other text markup in the Highlight ▸ flyout, and edits as itself.
-    assert!(printcraft_ui_egui::comments::GROUPS[1].contains(&printcraft_ui_egui::comments::CommentTool::Squiggly));
-    assert_eq!(printcraft_ui_egui::comments::tool_for(&c[0]), Some(printcraft_ui_egui::comments::CommentTool::Squiggly));
+    assert!(pdfcraft_ui_egui::comments::GROUPS[1].contains(&pdfcraft_ui_egui::comments::CommentTool::Squiggly));
+    assert_eq!(pdfcraft_ui_egui::comments::tool_for(&c[0]), Some(pdfcraft_ui_egui::comments::CommentTool::Squiggly));
 }
 
 #[test]
 fn the_opacity_set_for_a_tool_goes_into_its_new_comments() {
-    use printcraft_ui_egui::comments::CommentTool;
+    use pdfcraft_ui_egui::comments::CommentTool;
     let mut h = harness(|app| app.comment_prefs.set_opacity(CommentTool::StrikeOut, 0.5));
     // Clamped: an invisible comment can't be found again.
     h.state_mut().comment_prefs.set_opacity(CommentTool::Underline, 0.0);
@@ -583,7 +711,7 @@ fn the_opacity_set_for_a_tool_goes_into_its_new_comments() {
     assert_eq!(c.len(), 1, "{c:?}");
     // The new comment carries /CA 0.5 (read back from the document's bytes).
     let bytes = h.state().session.get(h.state().views[0].id).unwrap().bytes.as_ref().clone();
-    let doc = printcraft_cos::Document::open(std::sync::Arc::new(bytes)).unwrap();
+    let doc = pdfcraft_cos::Document::open(std::sync::Arc::new(bytes)).unwrap();
     let opacities: Vec<f64> = doc
         .object_numbers()
         .into_iter()
@@ -597,4 +725,44 @@ fn the_opacity_set_for_a_tool_goes_into_its_new_comments() {
     h.state_mut().set_option("quick", "strikeout").unwrap();
     h.run_steps(2);
     h.get_by_label("Opacity");
+}
+
+/// #225: comment tools open the Comments panel until the user closes it; then it stays closed,
+/// across restarts, until they open it again.
+#[test]
+fn a_closed_comments_panel_stays_closed_when_picking_comment_tools() {
+    use pdfcraft_ui_egui::RightPanel;
+    let mut h = harness(|_| {});
+    assert_eq!(h.state().right, None);
+    assert!(h.state_mut().execute("comment.highlight"));
+    h.run_steps(2);
+    assert_eq!(h.state().right, Some(RightPanel::Comments), "Acrobat opens Comments with the tools");
+    h.get_by_label("Close").click();
+    h.run_steps(2);
+    assert_eq!(h.state().right, None);
+    for tool in ["select", "comment.underline", "comment.note", "comment.highlight"] {
+        if tool == "select" {
+            h.state_mut().quick_tool = QuickTool::Select;
+        } else {
+            assert!(h.state_mut().execute(tool));
+        }
+        h.run_steps(2);
+        assert_eq!(h.state().right, None, "{tool} reopened the closed Comments panel");
+    }
+    let mut again = PdfCraftApp::new();
+    again.restore(&h.state().persist());
+    assert!(again.comments_panel_closed, "the choice survives a restart");
+    // Opening it again from the rail lets the tools open it once more.
+    h.get_by_label("Comments").click();
+    h.run_steps(2);
+    assert_eq!(h.state().right, Some(RightPanel::Comments));
+    assert!(!h.state().comments_panel_closed);
+    // What the rail and View menu call; "Bookmarks" labels two controls on screen.
+    h.state_mut().choose_right_panel(Some(RightPanel::Bookmarks));
+    h.state_mut().choose_right_panel(None);
+    h.run_steps(2);
+    assert!(!h.state().comments_panel_closed, "switching to and closing another panel isn't closing Comments");
+    assert!(h.state_mut().execute("comment.strikeout"));
+    h.run_steps(2);
+    assert_eq!(h.state().right, Some(RightPanel::Comments));
 }

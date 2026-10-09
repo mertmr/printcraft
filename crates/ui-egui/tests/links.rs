@@ -1,14 +1,15 @@
 //! Community links: the Discord button is one click away everywhere; Help menu, About dialog and
-//! home screen open the ArtCraft and PrintCraft pages.
+//! home screen open the ArtCraft and PdfCraft pages.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use printcraft_engine::links;
-use printcraft_ui_egui::{Dialog, PrintCraftApp};
+use pdfcraft_engine::links;
+use pdfcraft_ui_egui::{Dialog, PdfCraftApp};
 
-fn harness(setup: impl FnOnce(&mut PrintCraftApp) + 'static) -> Harness<'static, PrintCraftApp> {
+fn harness(setup: impl FnOnce(&mut PdfCraftApp) + 'static) -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
-        let mut app = PrintCraftApp::new();
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         setup(&mut app);
         app
     });
@@ -29,8 +30,8 @@ fn discord_button_in_the_top_bar_opens_discord() {
 fn home_screen_links() {
     for (label, url) in [
         ("Join our Discord", links::DISCORD),
-        ("PrintCraft web page", "https://getartcraft.com/apps/printcraft"),
-        ("PrintCraft on GitHub", "https://github.com/storytold/printcraft"),
+        ("PdfCraft web page", "https://getartcraft.com/apps/pdfcraft"),
+        ("PdfCraft on GitHub", "https://github.com/storytold/pdfcraft"),
         ("ArtCraft website", "https://getartcraft.com"),
     ] {
         let mut h = harness(|_| {});
@@ -61,6 +62,24 @@ fn help_commands_open_each_link() {
         let mut h = harness(|_| {});
         assert!(h.state_mut().execute(l.command), "{}", l.command);
         assert_eq!(h.state().last_opened_url.as_deref(), Some(l.url));
-        assert_eq!(printcraft_engine::commands::command(l.command).unwrap().menu, Some("Help"));
+        assert_eq!(pdfcraft_engine::commands::command(l.command).unwrap().menu, Some("Help"));
     }
+}
+
+#[test]
+fn about_dialog_has_contributors_and_models_tabs() {
+    let mut h = harness(|app| app.dialog = Some(Dialog::About));
+    h.get_by_label("Contributors").click();
+    h.run_steps(2);
+    // The owner is always in the compiled-in credits (contributors/contributors.json), shown by username.
+    h.get_by_label("@echelon");
+    h.get_by_label("Table").click();
+    h.run_steps(2);
+    h.get_by_label("PRs");
+    h.get_by_label("Display name").click();
+    h.run_steps(2);
+    h.get_by_label("Brandon Thomas");
+    h.get_by_label("Models").click();
+    h.run_steps(2);
+    assert!(h.query_all_by_label("Anthropic").count() >= 1);
 }

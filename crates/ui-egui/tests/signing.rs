@@ -3,8 +3,8 @@
 use egui::{Pos2, pos2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use printcraft_engine::SignatureStatus;
-use printcraft_ui_egui::{Dialog, PrintCraftApp, QuickTool, RightPanel, SignStep};
+use pdfcraft_engine::SignatureStatus;
+use pdfcraft_ui_egui::{Dialog, PdfCraftApp, QuickTool, RightPanel, SignStep};
 
 const FIXTURE: &[u8] = b"%PDF-1.7
 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
@@ -21,15 +21,16 @@ trailer << /Root 1 0 R >>
 fn dir() -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("printcraft-signing-ui-{}-{n}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("pdfcraft-signing-ui-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
-fn harness(dir: std::path::PathBuf) -> Harness<'static, PrintCraftApp> {
+fn harness(dir: std::path::PathBuf) -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
-        let mut app = PrintCraftApp::new();
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("contract.pdf", None, FIXTURE.to_vec()).expect("opens");
         app.set_option("left", "closed").unwrap();
         app.export_dir_override = Some(dir.to_string_lossy().into_owned());
@@ -40,12 +41,12 @@ fn harness(dir: std::path::PathBuf) -> Harness<'static, PrintCraftApp> {
     h
 }
 
-fn at(h: &Harness<'static, PrintCraftApp>, x: f32, y: f32) -> Pos2 {
+fn at(h: &Harness<'static, PdfCraftApp>, x: f32, y: f32) -> Pos2 {
     let r = h.state().views[0].page_screen_rect(0).expect("page 1 on screen");
     pos2(r.left() + x / 300.0 * r.width(), r.top() + (200.0 - y) / 200.0 * r.height())
 }
 
-fn drag(h: &mut Harness<'static, PrintCraftApp>, from: Pos2, to: Pos2) {
+fn drag(h: &mut Harness<'static, PdfCraftApp>, from: Pos2, to: Pos2) {
     h.hover_at(from);
     h.run_steps(1);
     h.drag_at(from);
@@ -58,7 +59,7 @@ fn drag(h: &mut Harness<'static, PrintCraftApp>, from: Pos2, to: Pos2) {
     h.run_steps(3);
 }
 
-fn field<'a>(h: &'a Harness<'static, PrintCraftApp>, label: &'a str) -> egui_kittest::Node<'a> {
+fn field<'a>(h: &'a Harness<'static, PdfCraftApp>, label: &'a str) -> egui_kittest::Node<'a> {
     h.get_all_by_label(label).last().unwrap_or_else(|| panic!("no {label:?}"))
 }
 
@@ -154,7 +155,8 @@ fn drawing_a_signature_creating_an_id_signing_and_trusting() {
     assert!(v.name.contains("signed version") && v.signatures.iter().any(|x| x.signed));
     // Trusted certificates and the ID list persist.
     let saved = s.persist();
-    let mut fresh = PrintCraftApp::new();
+    let mut fresh = PdfCraftApp::new();
+    fresh.set_option("language", "en").unwrap();
     fresh.restore(&saved);
     assert_eq!((fresh.digital_ids.len(), fresh.session.trusted_certificates().len()), (1, 1));
 }
@@ -224,7 +226,7 @@ fn clicking_an_empty_signature_field_signs_it() {
     assert_eq!(h.state().dialog, Some(Dialog::Sign));
     assert_eq!(h.state().sign_draft.as_ref().and_then(|d| d.field.clone()).as_deref(), Some("Approver"));
     let entry = {
-        let id = printcraft_engine::sign::pkcs12::open(
+        let id = pdfcraft_engine::sign::pkcs12::open(
             &std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../sign/tests/data/ec-p256.p12")).unwrap(),
             "test",
         )
@@ -243,4 +245,55 @@ fn clicking_an_empty_signature_field_signs_it() {
     let s = h.state();
     let sig = s.session.get(s.views[1].id).unwrap().signatures.iter().find(|x| x.field == "Approver").cloned().unwrap();
     assert!(sig.signed && sig.visible);
+}
+
+#[test]
+fn os_store_identities_are_not_persisted() {
+    let mut app = PdfCraftApp::new();
+    app.set_option("language", "en").unwrap();
+    for path in ["windows:Store signer", "keychain:Store signer", "file-id.p12"] {
+        app.digital_ids.push(pdfcraft_ui_egui::DigitalIdEntry {
+            path: path.into(),
+            name: "Signer".into(),
+            issuer: "Test issuer".into(),
+            email: String::new(),
+            expires: "2030.01.01".into(),
+        });
+    }
+    let saved = app.persist();
+    let settings: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(settings["digital_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(settings["digital_ids"][0]["path"], "file-id.p12");
+    let mut restored = PdfCraftApp::new();
+    restored.set_option("language", "en").unwrap();
+    restored.restore(&saved);
+    assert_eq!(restored.digital_ids.len(), 1);
+    assert_eq!(restored.digital_ids[0].path, "file-id.p12");
+}
+
+#[test]
+fn windows_store_identity_does_not_ask_for_a_file_password() {
+    let mut h = harness(dir());
+    h.state_mut().start_signing(0, None, None, None);
+    // A synthetic picker entry exercises the dialog without a real Windows identity.
+    h.state_mut().digital_ids.push(pdfcraft_ui_egui::DigitalIdEntry {
+        path: "windows:No Such Signer".into(),
+        name: "Store signer".into(),
+        issuer: "Test issuer".into(),
+        email: String::new(),
+        expires: "2030.01.01".into(),
+    });
+    let draft = h.state_mut().sign_draft.as_mut().unwrap();
+    draft.step = SignStep::Choose;
+    draft.selected = Some(0);
+    h.run_steps(3);
+    h.get_by_label("Continue").click();
+    h.run_steps(3);
+    h.get_by_label("Sign as \"Store signer\"");
+    assert_eq!(h.query_all_by_label("Digital ID password").count(), 0);
+    h.get_by_label("The key is in the Windows certificate store, which may ask to allow PdfCraft to use it.");
+    h.get_by_label("Sign").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialog, Some(Dialog::Sign));
+    assert!(h.state().sign_draft.as_ref().unwrap().error.as_ref().unwrap().contains("Windows certificate store"));
 }

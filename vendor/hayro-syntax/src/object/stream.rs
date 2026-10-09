@@ -167,20 +167,43 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
+        self.decode_within(image_params, usize::MAX)
+    }
+
+    /// PdfCraft patch: the decoded data of the stream, for callers that budget what a page
+    /// holds. Flate, LZW and RunLength stop at `max` bytes (and at
+    /// [`crate::filter::MAX_DECODED_STREAM`] in any case). A stream without filters is returned
+    /// as it is; ASCIIHex and ASCII85 barely expand, and the image codecs stop at their own pixel
+    /// limits.
+    pub fn decoded_within(&self, max: usize) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode_within(&ImageDecodeParams::default(), max)
+            .map(|r| r.data)
+    }
+
+    fn decode_within(
+        &self,
+        image_params: &ImageDecodeParams,
+        max: usize,
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
         let data = self.raw_data();
         let filters_and_params = self.filters_and_params();
+        let count = filters_and_params.filters.len();
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        for (filter, params) in filters_and_params
+        for (i, (filter, params)) in filters_and_params
             .filters
             .iter()
             .zip(filters_and_params.params.iter())
+            .enumerate()
         {
+            // PdfCraft patch: see `filter::decode_limit`.
+            let limit = crate::filter::decode_limit(image_params, i + 1 == count).min(max);
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
+                limit,
             )?;
             current = Some(new);
         }
@@ -302,8 +325,12 @@ fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
 }
 
 fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
-    let stream_offset = find_needle(r.tail()?, b"stream")?;
-    r.read_bytes(stream_offset)?;
+    // PdfCraft patch: `stream` must be the next token. Scanning ahead to a later
+    // `stream` made a dictionary look like a stream — in particular an indirect
+    // `/AP /N` appearance-state dictionary (`<< /Yes 5 0 R /Off 6 0 R >>`, as Quartz
+    // writes checkboxes). The widget then had no form to draw, so the box disappeared.
+    // A wrong `/Length` still recovers, because that keyword sits directly after the dict.
+    r.skip_white_spaces_and_comments();
     r.forward_tag(b"stream")?;
 
     r.forward_tag(b"\n")
@@ -384,5 +411,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(stream.data, b"abcdefghij");
+    }
+
+    /// A dictionary followed by some other object's stream is not itself a stream.
+    /// `parse_fallback` used to latch onto that later `stream` keyword.
+    #[test]
+    fn dictionary_is_not_a_later_objects_stream() {
+        let data = b"<< /Yes 5 0 R /Off 6 0 R >>\nendobj\n11 0 obj << /Length 5 >> stream\nhello\nendstream";
+        let mut r = Reader::new(data);
+        assert!(r.read_with_context::<Stream<'_>>(&ReaderContext::dummy()).is_none());
     }
 }

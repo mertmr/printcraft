@@ -3,7 +3,7 @@
 use egui::{Key, Modifiers};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use printcraft_ui_egui::PrintCraftApp;
+use pdfcraft_ui_egui::PdfCraftApp;
 
 const PAGES: &[u8] = b"%PDF-1.7
 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
@@ -14,9 +14,10 @@ const PAGES: &[u8] = b"%PDF-1.7
 trailer << /Root 1 0 R >>
 %%EOF";
 
-fn harness() -> Harness<'static, PrintCraftApp> {
+fn harness() -> Harness<'static, PdfCraftApp> {
     let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
-        let mut app = PrintCraftApp::new();
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("pages.pdf", None, PAGES.to_vec()).expect("opens");
         app.set_option("left", "closed").unwrap();
         app.set_option("panel", "bookmarks").unwrap();
@@ -26,9 +27,9 @@ fn harness() -> Harness<'static, PrintCraftApp> {
     h
 }
 
-fn outline(h: &Harness<'static, PrintCraftApp>) -> Vec<(String, Option<usize>, usize)> {
+fn outline(h: &Harness<'static, PdfCraftApp>) -> Vec<(String, Option<usize>, usize)> {
     let id = h.state().views[0].id;
-    fn flat(items: &[printcraft_render::OutlineItem], depth: usize, out: &mut Vec<(String, Option<usize>, usize)>) {
+    fn flat(items: &[pdfcraft_render::OutlineItem], depth: usize, out: &mut Vec<(String, Option<usize>, usize)>) {
         for i in items {
             out.push((i.title.clone(), i.page, depth));
             flat(&i.children, depth + 1, out);
@@ -40,12 +41,12 @@ fn outline(h: &Harness<'static, PrintCraftApp>) -> Vec<(String, Option<usize>, u
 }
 
 /// The inline rename editor (the text field, not its inner text run).
-fn field<'a>(h: &'a Harness<'static, PrintCraftApp>, value: &'a str) -> egui_kittest::Node<'a> {
+fn field<'a>(h: &'a Harness<'static, PdfCraftApp>, value: &'a str) -> egui_kittest::Node<'a> {
     h.query_all_by_value(value).next().unwrap_or_else(|| panic!("no editor showing {value:?}"))
 }
 
 /// Add a bookmark with ⌘B at the current page and name it by typing.
-fn add(h: &mut Harness<'static, PrintCraftApp>, title: &str) {
+fn add(h: &mut Harness<'static, PdfCraftApp>, title: &str) {
     h.key_press_modifiers(Modifiers::COMMAND, Key::B);
     h.run_steps(3);
     field(h, "Untitled"); // the inline editor is open and focused
@@ -57,7 +58,7 @@ fn add(h: &mut Harness<'static, PrintCraftApp>, title: &str) {
     h.run_steps(3);
 }
 
-fn menu(h: &mut Harness<'static, PrintCraftApp>, bookmark: &str, item: &str) {
+fn menu(h: &mut Harness<'static, PdfCraftApp>, bookmark: &str, item: &str) {
     h.get_by_label(bookmark).click_secondary();
     h.run_steps(2);
     h.get_by_label(item).click();
@@ -129,14 +130,79 @@ fn number_pages_dialog_labels_the_selected_pages() {
 }
 
 #[test]
+fn search_finds_collapsed_bookmarks_and_keeps_original_paths() {
+    use pdfcraft_engine::Edit;
+    let mut h = harness();
+    for (parent, index, title, page) in
+        [(vec![], 0, "Unrelated", 0), (vec![], 1, "Reports", 0), (vec![1], 0, "Other chapter", 1), (vec![1], 1, "Résumé results", 2)]
+    {
+        h.state_mut().apply_edit(Edit::AddBookmark { parent, index, title: title.into(), page });
+    }
+    h.run_steps(3);
+    h.get_by_label("Bookmark options").click();
+    h.run_steps(2);
+    h.get_by_label("Collapse all bookmarks").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Résumé results").is_none());
+    let id = h.state().views[0].id;
+    let before = h.state().session.save_full_bytes(id).unwrap();
+    h.get_by_label("Search").click();
+    h.run_steps(1);
+    h.get_by_label("Search").type_text("RÉSUMÉ");
+    h.run_steps(3);
+    h.get_by_label("Reports");
+    h.get_by_label("Résumé results").click();
+    h.run_steps(3);
+    assert_eq!(h.state().views[0].current, 2);
+    assert!(h.query_by_label("Unrelated").is_none());
+    assert!(h.query_by_label("Other chapter").is_none());
+    assert_eq!(h.state().session.save_full_bytes(id).unwrap(), before, "search doesn't edit the PDF");
+    if let Ok(dir) = std::env::var("PDFCRAFT_BOOKMARK_SHOTS") {
+        h.render().unwrap().save(std::path::Path::new(&dir).join("filtered-bookmarks.png")).unwrap();
+    }
+    menu(&mut h, "Résumé results", "Delete");
+    assert_eq!(outline(&h).len(), 3);
+    assert!(outline(&h).iter().any(|b| b.0 == "Other chapter"));
+    h.get_by_label("No matches.");
+    add(&mut h, "New section");
+    assert!(outline(&h).iter().any(|b| b.0 == "New section"), "new bookmarks remain nameable while searching");
+    h.get_by_label("No matches.");
+    h.get_by_label("Clear").click();
+    h.run_steps(3);
+    h.get_by_label("Unrelated");
+    assert!(h.query_by_label("Other chapter").is_none(), "search did not change saved expansion state");
+}
+
+#[test]
+fn bookmark_search_is_per_document() {
+    let mut h = harness();
+    add(&mut h, "First document");
+    h.get_by_label("Search").click();
+    h.run_steps(1);
+    h.get_by_label("Search").type_text("not found");
+    h.run_steps(3);
+    h.get_by_label("No matches.");
+    h.state_mut().open_bytes("second.pdf", None, PAGES.to_vec()).unwrap();
+    h.run_steps(3);
+    add(&mut h, "Second document");
+    h.get_by_label("Second document");
+    h.state_mut().active = Some(0);
+    h.run_steps(3);
+    h.get_by_label("No matches.");
+    h.get_by_label("Clear").click();
+    h.run_steps(3);
+    h.get_by_label("First document");
+}
+
+#[test]
 fn expanding_and_collapsing_all_bookmarks() {
-    use printcraft_engine::Edit;
+    use pdfcraft_engine::Edit;
     let mut h = harness();
     for (parent, title) in [(vec![], "Part"), (vec![0], "Chapter"), (vec![0, 0], "Section")] {
         h.state_mut().apply_edit(Edit::AddBookmark { parent, index: 0, title: title.into(), page: 0 });
     }
     h.run_steps(3);
-    let shown = |h: &Harness<'static, PrintCraftApp>, t: &str| h.query_by_label(t).is_some();
+    let shown = |h: &Harness<'static, PdfCraftApp>, t: &str| h.query_by_label(t).is_some();
     h.get_by_label("Bookmark options").click();
     h.run_steps(2);
     h.get_by_label("Expand all bookmarks").click();

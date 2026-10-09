@@ -96,7 +96,7 @@ impl<'a> Type3<'a> {
     }
 
     pub(crate) fn char_code_to_unicode(&self, char_code: u32) -> Option<BfString> {
-        // PrintCraft patch: upstream only consulted ToUnicode. Many Type3 fonts (e.g. TeX/dvips
+        // PdfCraft patch: upstream only consulted ToUnicode. Many Type3 fonts (e.g. TeX/dvips
         // bitmap fonts) have none; fall back to the /Encoding glyph names, then to printable
         // ASCII codes, as other viewers do for text extraction.
         self.to_unicode
@@ -123,7 +123,7 @@ impl<'a> Type3<'a> {
         paint: &Paint<'a>,
         device: &mut impl Device<'a>,
     ) -> Option<()> {
-        // PrintCraft patch: a glyph procedure may show text in this same font (through
+        // PdfCraft patch: a glyph procedure may show text in this same font (through
         // inherited resources), recursing until the stack overflowed.
         if glyph.nesting_depth > crate::context::MAX_PAINT_NESTING
             || !crate::context::take_nested_paint(glyph.nesting_depth)
@@ -141,7 +141,8 @@ impl<'a> Type3<'a> {
 
         let name = self.glyph_simulator.glyph_to_string(glyph.glyph_id)?;
         let program = self.char_procs.get(&name)?;
-        let decoded = program.decoded().ok()?;
+        // PdfCraft patch: see `context::MAX_PAGE_CONTENT`.
+        let decoded = crate::context::decode_content(program)?;
         let iter = TypedIter::new(decoded.as_ref());
 
         let is_shape_glyph = {

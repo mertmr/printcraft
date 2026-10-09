@@ -13,9 +13,10 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::Write as _;
 
-use printcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
-use printcraft_forms::{FieldKind, FieldValue};
+use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
+use pdfcraft_forms::{FieldKind, FieldValue};
 
 #[cfg(test)]
 mod tests;
@@ -29,7 +30,7 @@ pub enum DataError {
     #[error("nothing in the file matches this document")]
     NothingImported,
     #[error(transparent)]
-    Cos(#[from] printcraft_cos::CosError),
+    Cos(#[from] pdfcraft_cos::CosError),
 }
 
 /// What export writes.
@@ -151,7 +152,7 @@ fn nums_of(doc: &Document, o: Option<&Object>) -> Vec<f64> {
 fn text_of(doc: &Document, d: &Dict, k: &[u8]) -> Option<String> {
     d.get(k).and_then(|o| match &*doc.resolve(o) {
         Object::String(s) => Some(s.to_text()),
-        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+        Object::Name(n) => Some(pdfcraft_forms::name_text(n)),
         _ => None,
     })
 }
@@ -168,7 +169,7 @@ fn arr(v: &[f64]) -> Object {
 
 /// Every comment as an XFDF element (one line per comment, replies included).
 fn xfdf_annots(doc: &Document, out: &mut String) {
-    let pages = printcraft_model::pages(doc);
+    let pages = pdfcraft_model::pages(doc);
     // NM of every annotation, for inreplyto.
     let mut names: HashMap<ObjRef, String> = HashMap::new();
     for p in &pages {
@@ -291,7 +292,7 @@ fn xfdf_fields(doc: &Document, out: &mut String) {
         kids: Vec<(String, Node)>,
     }
     let mut root = Node::default();
-    for f in printcraft_forms::fields(doc) {
+    for f in pdfcraft_forms::fields(doc) {
         if matches!(f.kind, FieldKind::PushButton | FieldKind::Signature) {
             continue;
         }
@@ -346,16 +347,20 @@ pub fn export_xfdf(doc: &Document, comments: bool, fields: bool, file: &str) -> 
 
 fn pdf_string(s: &str) -> Vec<u8> {
     let mut v = Vec::new();
-    printcraft_cos::serialize(&Object::String(PdfString::text(s)), &mut v);
+    pdfcraft_cos::serialize(&Object::String(PdfString::text(s)), &mut v);
     v
 }
 
-/// FDF with field values and/or comments (direct objects only; appearances are not carried).
+/// FDF with field values and/or comments (appearances are not carried). Each comment is an
+/// indirect object of the FDF, so a reply's `/IRT` can point at its parent's object there
+/// (§12.7.8.3.1); nothing else refers back into the source document.
 pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> Vec<u8> {
     let mut body: Vec<u8> = b"<< /FDF << ".to_vec();
+    // Comment dictionaries, written after the root as objects 2, 3, …
+    let mut annots: Vec<Dict> = Vec::new();
     if fields {
         body.extend_from_slice(b"/Fields [");
-        for f in printcraft_forms::fields(doc) {
+        for f in pdfcraft_forms::fields(doc) {
             if matches!(f.kind, FieldKind::PushButton | FieldKind::Signature) {
                 continue;
             }
@@ -365,10 +370,10 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> V
             match f.kind {
                 FieldKind::CheckBox | FieldKind::Radio => {
                     let v = f.value.first().cloned().unwrap_or_else(|| "Off".into());
-                    printcraft_cos::serialize(&Object::Name(v.into_bytes()), &mut body);
+                    pdfcraft_cos::serialize(&Object::Name(pdfcraft_forms::name_bytes(&v)), &mut body);
                 }
                 FieldKind::List if f.value.len() > 1 => {
-                    printcraft_cos::serialize(&Object::Array(f.value.iter().map(|v| Object::String(PdfString::text(v))).collect()), &mut body);
+                    pdfcraft_cos::serialize(&Object::Array(f.value.iter().map(|v| Object::String(PdfString::text(v))).collect()), &mut body);
                 }
                 _ => body.extend(pdf_string(f.value.first().map(String::as_str).unwrap_or(""))),
             }
@@ -377,44 +382,71 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> V
         body.extend_from_slice(b"] ");
     }
     if comments {
-        body.extend_from_slice(b"/Annots [");
-        for (pi, p) in printcraft_model::pages(doc).iter().enumerate() {
+        // Every exported comment with its source reference, numbered in export order.
+        let mut picked: Vec<(Option<ObjRef>, Dict, usize)> = Vec::new();
+        for (pi, p) in pdfcraft_model::pages(doc).iter().enumerate() {
             for a in p.dict.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap_or_default() {
-                let Some(mut d) = doc.resolve(&a).as_dict().cloned() else { continue };
-                let Some(sub) = d.name(b"Subtype") else { continue };
-                if !SUBTYPES.iter().any(|(s, _)| s.as_bytes() == sub) {
-                    continue;
+                let Some(d) = doc.resolve(&a).as_dict().cloned() else { continue };
+                if d.name(b"Subtype").is_some_and(|sub| SUBTYPES.iter().any(|(s, _)| s.as_bytes() == sub)) {
+                    picked.push((a.as_ref(), d, pi));
                 }
-                // Only direct values travel: references into this file would dangle.
-                for k in [&b"P"[..], b"AP", b"Popup", b"IRT", b"Parent", b"FS", b"Sound"] {
-                    d.remove(k);
-                }
-                let keys: Vec<Vec<u8>> = d.iter().filter(|(_, v)| matches!(v, Object::Ref(_))).map(|(k, _)| k.clone()).collect();
-                for k in keys {
-                    let Some(o) = d.get(&k) else { continue };
-                    let v = (*doc.resolve(o)).clone();
-                    if matches!(v, Object::Stream(_)) {
-                        d.remove(&k);
-                    } else {
-                        d.set(k, v);
-                    }
-                }
-                d.set(b"Page".to_vec(), Object::Int(pi as i64));
-                printcraft_cos::serialize(&Object::Dict(d), &mut body);
-                body.push(b' ');
             }
+        }
+        let numbers: HashMap<ObjRef, u32> =
+            picked.iter().enumerate().filter_map(|(i, (r, _, _))| Some(((*r)?, u32::try_from(i).ok()?.checked_add(2)?))).collect();
+        for (_, mut d, pi) in picked {
+            // A reply points at its parent's object in this FDF; a parent that isn't exported
+            // leaves the reply unthreaded.
+            let irt = d.get(b"IRT").and_then(Object::as_ref).and_then(|r| numbers.get(&r)).copied();
+            // Only direct values travel: references into this file would dangle.
+            for k in [&b"P"[..], b"AP", b"Popup", b"IRT", b"Parent", b"FS", b"Sound"] {
+                d.remove(k);
+            }
+            let keys: Vec<Vec<u8>> = d.iter().filter(|(_, v)| matches!(v, Object::Ref(_))).map(|(k, _)| k.clone()).collect();
+            for k in keys {
+                let Some(o) = d.get(&k) else { continue };
+                let v = (*doc.resolve(o)).clone();
+                if matches!(v, Object::Stream(_)) {
+                    d.remove(&k);
+                } else {
+                    d.set(k, v);
+                }
+            }
+            if let Some(num) = irt {
+                d.set(b"IRT".to_vec(), Object::Ref(ObjRef::new(num, 0)));
+            }
+            d.set(b"Page".to_vec(), Object::Int(pi as i64));
+            annots.push(d);
+        }
+        body.extend_from_slice(b"/Annots [");
+        for i in 0..annots.len() {
+            let _ = write!(body, "{} 0 R ", i + 2);
         }
         body.extend_from_slice(b"] ");
     }
     body.extend_from_slice(b"/F ");
     body.extend(pdf_string(file));
     body.extend_from_slice(b" >> >>");
-    let mut out = b"%FDF-1.2\n%\xE2\xE3\xCF\xD3\n1 0 obj\n".to_vec();
+    let mut out = b"%FDF-1.2\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = Vec::with_capacity(annots.len() + 1);
+    offsets.push(out.len());
+    out.extend_from_slice(b"1 0 obj\n");
     out.extend(body);
-    out.extend_from_slice(b"\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+    out.extend_from_slice(b"\nendobj\n");
+    for (i, d) in annots.into_iter().enumerate() {
+        offsets.push(out.len());
+        let _ = writeln!(out, "{} 0 obj", i + 2);
+        pdfcraft_cos::serialize(&Object::Dict(d), &mut out);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    let _ = write!(out, "xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1);
+    for o in offsets {
+        let _ = writeln!(out, "{o:010} 00000 n ");
+    }
+    let _ = write!(out, "trailer\n<< /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n");
     out
 }
-
 /// The XML element name for a field name (letters, digits, `_`, `-`, `.`).
 fn xml_name(name: &str) -> String {
     let mut s: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '_' | '-' | '.') { c } else { '_' }).collect();
@@ -426,7 +458,7 @@ fn xml_name(name: &str) -> String {
 
 /// Form data as XML, CSV or tab-delimited text (Acrobat's Export data formats).
 pub fn export_data(doc: &Document, format: Format) -> String {
-    let fields: Vec<(String, String)> = printcraft_forms::fields(doc)
+    let fields: Vec<(String, String)> = pdfcraft_forms::fields(doc)
         .into_iter()
         .filter(|f| !matches!(f.kind, FieldKind::PushButton | FieldKind::Signature))
         .map(|f| {
@@ -471,7 +503,7 @@ pub fn export_data(doc: &Document, format: Format) -> String {
 
 /// Set the values of fields named in `values` (full names), counting what took.
 fn apply_values(doc: &mut Document, values: &[(String, Vec<String>)], report: &mut Report) {
-    let all = printcraft_forms::fields(doc);
+    let all = pdfcraft_forms::fields(doc);
     for (name, vals) in values {
         let Some(f) = all.iter().find(|f| &f.name == name) else { continue };
         let first = vals.first().cloned().unwrap_or_default();
@@ -481,7 +513,7 @@ fn apply_values(doc: &mut Document, values: &[(String, Vec<String>)], report: &m
             FieldKind::Radio => FieldValue::Radio((!first.is_empty() && first != "Off").then_some(first)),
             // XML, CSV and text hold a multi-select list's values in one cell, joined by ", "
             // (as export_data writes them); split it unless the whole cell is one option.
-            FieldKind::List if f.has(printcraft_forms::flags::MULTI_SELECT) && vals.len() == 1 && !f.options.iter().any(|(e, _)| *e == first) => {
+            FieldKind::List if f.has(pdfcraft_forms::flags::MULTI_SELECT) && vals.len() == 1 && !f.options.iter().any(|(e, _)| *e == first) => {
                 FieldValue::Choice(first.split(", ").filter(|v| !v.is_empty()).map(str::to_string).collect())
             }
             FieldKind::Combo | FieldKind::List => FieldValue::Choice(vals.iter().filter(|v| !v.is_empty()).cloned().collect()),
@@ -490,9 +522,9 @@ fn apply_values(doc: &mut Document, values: &[(String, Vec<String>)], report: &m
         // Read-only fields still take imported data, as in Acrobat.
         let ro = f.read_only();
         if ro {
-            let _ = doc.update_dict(f.obj, |d| d.set(b"Ff".to_vec(), Object::Int((f.flags & !printcraft_forms::flags::READ_ONLY) as i64)));
+            let _ = doc.update_dict(f.obj, |d| d.set(b"Ff".to_vec(), Object::Int((f.flags & !pdfcraft_forms::flags::READ_ONLY) as i64)));
         }
-        match printcraft_forms::set_value(doc, name, &v) {
+        match pdfcraft_forms::set_value(doc, name, &v) {
             Ok(()) => report.fields += 1,
             Err(_) => report.rejected.push(name.clone()),
         }
@@ -612,7 +644,7 @@ fn place(doc: &mut Document, page_ref: ObjRef, d: Dict) -> Result<ObjRef, DataEr
     }
     let r = doc.add(Object::Dict(d));
     // Our own appearance where we can draw one; others keep none (viewers draw a default).
-    let _ = printcraft_annot::set_appearance(doc, r);
+    let _ = pdfcraft_annot::set_appearance(doc, r);
     kept.push(Object::Ref(r));
     doc.update_dict(page_ref, |p| p.set(b"Annots".to_vec(), Object::Array(kept)))?;
     Ok(r)
@@ -625,7 +657,7 @@ fn import_xfdf(doc: &mut Document, text: &str) -> Result<Report, DataError> {
         return Err(DataError::UnknownFormat);
     }
     let mut report = Report::default();
-    let pages: Vec<ObjRef> = printcraft_model::pages(doc).iter().map(|p| p.obj).collect();
+    let pages: Vec<ObjRef> = pdfcraft_model::pages(doc).iter().map(|p| p.obj).collect();
     // Comments: parents first, then replies (whose /IRT needs the parent's reference).
     let mut by_name: HashMap<String, ObjRef> = HashMap::new();
     let mut later: Vec<(ObjRef, String)> = Vec::new();
@@ -678,7 +710,7 @@ fn import_xfdf(doc: &mut Document, text: &str) -> Result<Report, DataError> {
 }
 
 fn find_by_name(doc: &Document, nm: &str) -> Option<ObjRef> {
-    for p in printcraft_model::pages(doc) {
+    for p in pdfcraft_model::pages(doc) {
         for a in p.dict.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap_or_default() {
             if let Some(r) = a.as_ref()
                 && doc.get(r).as_dict().and_then(|d| text_of(doc, d, b"NM")).as_deref() == Some(nm)
@@ -727,7 +759,7 @@ fn walk_fdf(fdf: &Document, list: &[Object], prefix: &str, out: &mut Vec<(String
         if let Some(v) = d.get(b"V").map(|v| fdf.resolve(v)) {
             let vals: Vec<String> = match &*v {
                 Object::String(s) => vec![s.to_text()],
-                Object::Name(n) => vec![String::from_utf8_lossy(n).into_owned()],
+                Object::Name(n) => vec![pdfcraft_forms::name_text(n)],
                 Object::Array(a) => a.iter().filter_map(|x| fdf.resolve(x).as_string().map(|s| s.to_text())).collect(),
                 _ => Vec::new(),
             };
@@ -762,7 +794,7 @@ pub fn data_values(bytes: &[u8]) -> Result<Vec<(String, Vec<String>)>, DataError
     }
     if bytes.starts_with(b"%PDF") || bytes.windows(5).take(1024).any(|w| w == b"%PDF-") {
         let doc = Document::open(std::sync::Arc::new(bytes.to_vec())).map_err(|e| DataError::Malformed(e.to_string()))?;
-        return Ok(printcraft_forms::fields(&doc)
+        return Ok(pdfcraft_forms::fields(&doc)
             .into_iter()
             .filter(|f| !matches!(f.kind, FieldKind::PushButton | FieldKind::Signature))
             .map(|f| {
@@ -817,10 +849,16 @@ fn import_fdf(doc: &mut Document, bytes: &[u8]) -> Result<Report, DataError> {
     if let Some(list) = body.get(b"Fields").map(|f| fdf.resolve(f)).and_then(|f| f.as_array().cloned()) {
         walk_fdf(&fdf, &list, "", &mut values, 0);
     }
-    // Comments.
-    let pages: Vec<ObjRef> = printcraft_model::pages(doc).iter().map(|p| p.obj).collect();
+    // Comments: parents first, then replies (whose /IRT needs the parent's new reference).
+    let pages: Vec<ObjRef> = pdfcraft_model::pages(doc).iter().map(|p| p.obj).collect();
+    let mut placed: HashMap<ObjRef, ObjRef> = HashMap::new();
+    let mut later: Vec<(ObjRef, Option<ObjRef>, Option<String>)> = Vec::new();
     for a in body.get(b"Annots").map(|a| fdf.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap_or_default() {
-        let Object::Dict(mut d) = deep(&fdf, &a, 0) else { continue };
+        let Some(mut src) = fdf.resolve(&a).as_dict().cloned() else { continue };
+        // The parent is another comment: link it below rather than copying it in.
+        let irt = src.get(b"IRT").cloned();
+        src.remove(b"IRT");
+        let Object::Dict(mut d) = deep(&fdf, &Object::Dict(src), 0) else { continue };
         let Some(page) = d.get(b"Page").and_then(Object::as_int).and_then(|p| usize::try_from(p).ok()).and_then(|p| pages.get(p).copied()) else {
             continue;
         };
@@ -829,8 +867,22 @@ fn import_fdf(doc: &mut Document, bytes: &[u8]) -> Result<Report, DataError> {
         }
         d.remove(b"Page");
         d.set(b"P".to_vec(), Object::Ref(page));
-        place(doc, page, d)?;
+        let r = place(doc, page, d)?;
+        if let Some(fr) = a.as_ref() {
+            placed.insert(fr, r);
+        }
+        if let Some(irt) = irt {
+            let parent_name = fdf.resolve(&irt).as_dict().and_then(|p| text_of(&fdf, p, b"NM"));
+            later.push((r, irt.as_ref(), parent_name));
+        }
         report.comments += 1;
+    }
+    for (r, parent_obj, parent_name) in later {
+        // The parent imported from this file, else one already in the document with its name.
+        let parent = parent_obj.and_then(|p| placed.get(&p).copied()).or_else(|| parent_name.and_then(|nm| find_by_name(doc, &nm)));
+        if let Some(parent) = parent.filter(|p| *p != r) {
+            doc.update_dict(r, |d| d.set(b"IRT".to_vec(), Object::Ref(parent)))?;
+        }
     }
     apply_values(doc, &values, &mut report);
     Ok(report)

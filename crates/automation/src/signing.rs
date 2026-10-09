@@ -2,8 +2,8 @@
 //! document, and manage trusted certificates. Rectangles are points from the top-left of the
 //! displayed page.
 
-use printcraft_engine::sign::{self, Certificate, DigitalId, Modification, Name, PrivateKey};
-use printcraft_engine::{SignOptions, SignatureInfo, SignatureStatus};
+use pdfcraft_engine::sign::{self, Certificate, DigitalId, Modification, Name, PrivateKey};
+use pdfcraft_engine::{SignOptions, SignatureInfo, SignatureStatus};
 use serde_json::{Value, json};
 
 use crate::{Args, Automation, Result, ToolError, failed, write_atomic};
@@ -67,6 +67,7 @@ impl Automation {
             "sub_filter": s.sub_filter,
             "algorithm": s.algorithm,
             "timestamp": s.timestamp,
+            "timestamp_time": s.timestamp_time.map(|t| t.to_string()),
             "modification": modification,
             "changes": changes,
             "details": s.details,
@@ -123,6 +124,12 @@ impl Automation {
             return sign::keychain::find(&format!("keychain:{r}")).map_err(failed);
             #[cfg(not(target_os = "macos"))]
             return Err(failed(format!("keychain:{r}: Keychain identities are only available on macOS")));
+        }
+        if let Some(r) = a.str("id")?.strip_prefix("windows:") {
+            #[cfg(target_os = "windows")]
+            return sign::windows::find(&format!("windows:{r}")).map_err(failed);
+            #[cfg(not(target_os = "windows"))]
+            return Err(failed(format!("windows:{r}: Windows certificate store identities are only available on Windows")));
         }
         let path = self.resolve(a.str("id")?, false)?;
         let bytes = std::fs::read(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;

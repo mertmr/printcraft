@@ -1,10 +1,10 @@
-//! printcraft-automation — agent control for PrintCraft (architecture §13).
+//! pdfcraft-automation — agent control for PdfCraft (architecture §13).
 //!
 //! - **Layer:** L7. Headless: depends on the engine, never on a UI toolkit.
 //! - [`Automation`] is a tool set over an engine [`Session`]: open, inspect, render, extract and
 //!   find text, edit pages and metadata, undo/redo, save, combine, extract and split. Every tool
 //!   has a JSON Schema ([`tools`]) and takes and returns JSON, so the same table drives the MCP
-//!   server ([`mcp`]), `printcraft-cli run` and (later) the UI control channel.
+//!   server ([`mcp`]), `pdfcraft-cli run` and (later) the UI control channel.
 //! - Pages are **1-based** in every tool, as people number them. Rectangles are in PDF points
 //!   with the origin at the top-left of the displayed page.
 //! - An optional root directory confines every path a tool reads or writes.
@@ -14,10 +14,12 @@
 mod a11y;
 mod comments;
 mod content;
+mod conventions;
 mod forms;
 mod links;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+mod measure;
 mod printing;
 mod redact;
 mod signing;
@@ -27,8 +29,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use printcraft_engine::{DocId, Document, Edit, Session, commands};
-use printcraft_render::{PageRenderer, PageText, RenderConfig, RenderRequest, RequestKind};
+use pdfcraft_engine::{DocId, Document, Edit, Session, commands};
+use pdfcraft_platform::staging::{StagingName, create_staging, staging_suffixes};
+use pdfcraft_render::{PageRenderer, PageText, RenderConfig, RenderRequest, RequestKind};
 use serde_json::{Value, json};
 
 pub use tools::{ToolDef, tools};
@@ -77,7 +80,7 @@ const MAX_DPI: f64 = 600.0;
 /// Page texts of one document version: (the working bytes, one slot per page).
 type TextCache = (Arc<Vec<u8>>, Vec<Option<Arc<PageText>>>);
 
-/// A headless PrintCraft session driven by tool calls.
+/// A headless PdfCraft session driven by tool calls.
 pub struct Automation {
     session: Session,
     root: Option<PathBuf>,
@@ -100,7 +103,11 @@ impl Automation {
 
     /// Confine every path the tools read or write to `root` (relative paths resolve inside it).
     pub fn with_root(mut self, root: impl Into<PathBuf>) -> std::io::Result<Self> {
-        self.root = Some(root.into().canonicalize()?);
+        let root = root.into().canonicalize()?;
+        if !root.is_dir() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "the root must be a folder"));
+        }
+        self.root = Some(root);
         Ok(self)
     }
 
@@ -112,6 +119,20 @@ impl Automation {
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Save `bytes` that a caller writes on the session's behalf, such as `pdfcraft-cli run`
+    /// saving a rendered page. With a root, it is confined like a tool's own output (a relative
+    /// path resolves inside it) and written atomically. Without one, the path is written as
+    /// given, so `/dev/stdout` and the like still work. Returns where the file went.
+    pub fn write_output(&self, path: &str, bytes: &[u8]) -> Result<PathBuf> {
+        let target = self.resolve(path, true)?;
+        if self.root.is_some() {
+            write_atomic(&target, bytes)?;
+        } else {
+            std::fs::write(&target, bytes).map_err(|e| failed(format!("{path}: {e}")))?;
+        }
+        Ok(target)
     }
 
     /// Run the tool `name` with JSON `args` (an object; `null` means no arguments).
@@ -135,6 +156,7 @@ impl Automation {
                 self.apply(&a, edit)?
             }
             "page_render" => return self.page_render(&a).map(|c| vec![c]),
+            "comment_image_preview" => return self.comment_image_preview(&a),
             "text_extract" => self.text_extract(&a)?,
             "text_find" => self.text_find(&a)?,
             "page_rotate" => {
@@ -148,18 +170,18 @@ impl Automation {
                     None => (0..doc.info.pages.len()).collect(),
                 };
                 let parity = match a.opt_str("subset")?.unwrap_or("all") {
-                    "all" => printcraft_engine::PageParity::Both,
-                    "even" => printcraft_engine::PageParity::Even,
-                    "odd" => printcraft_engine::PageParity::Odd,
+                    "all" => pdfcraft_engine::PageParity::Both,
+                    "even" => pdfcraft_engine::PageParity::Even,
+                    "odd" => pdfcraft_engine::PageParity::Odd,
                     s => return Err(ToolError::InvalidArgs(format!("unknown subset {s:?} (all, even, odd)"))),
                 };
                 let orientation = match a.opt_str("orientation")?.unwrap_or("all") {
-                    "all" => printcraft_engine::PageOrientation::Both,
-                    "landscape" => printcraft_engine::PageOrientation::Landscape,
-                    "portrait" => printcraft_engine::PageOrientation::Portrait,
+                    "all" => pdfcraft_engine::PageOrientation::Both,
+                    "landscape" => pdfcraft_engine::PageOrientation::Landscape,
+                    "portrait" => pdfcraft_engine::PageOrientation::Portrait,
                     o => return Err(ToolError::InvalidArgs(format!("unknown orientation {o:?} (all, landscape, portrait)"))),
                 };
-                let pages = printcraft_engine::filter_pages(&self.doc(&a)?.info, &base, parity, orientation);
+                let pages = pdfcraft_engine::filter_pages(&self.doc(&a)?.info, &base, parity, orientation);
                 if pages.is_empty() {
                     return Err(failed("no pages match the filters"));
                 }
@@ -181,6 +203,7 @@ impl Automation {
             "page_insert_file" => self.insert_file(&a)?,
             "page_extract" => self.page_extract(&a)?,
             "doc_combine" => self.doc_combine(&a)?,
+            "doc_create_multiple" => self.doc_create_multiple(&a)?,
             "doc_split" => self.doc_split(&a)?,
             "edit_undo" => {
                 let id = self.doc(&a)?.id;
@@ -193,8 +216,12 @@ impl Automation {
                 json!({ "redone": label, "document": summary(self.doc(&a)?) })
             }
             "command_list" => self.command_list(&a)?,
+            "command_run" => return self.command_run(&a),
+            "command_batch" => self.command_batch(&a)?,
+            "doc_inspect" => self.doc_inspect(&a)?,
+            "render_preview" => return self.render_preview(&a).map(|c| vec![c]),
             "page_number" => {
-                use printcraft_organize::LabelStyle as L;
+                use pdfcraft_organize::LabelStyle as L;
                 let n = self.doc(&a)?.info.pages.len();
                 let (from, to) = (a.int("from")?, a.int("to")?);
                 if from < 1 || to < from || to as usize > n {
@@ -310,7 +337,7 @@ impl Automation {
                     .enumerate()
                     .map(|(i, im)| {
                         let (u, v) = (info.user_to_view(im.rect[0] as f32, im.rect[1] as f32), info.user_to_view(im.rect[2] as f32, im.rect[3] as f32));
-                        json!({ "image": i + 1, "rect": [r(u[0].min(v[0])), r(u[1].min(v[1])), r(u[0].max(v[0])), r(u[1].max(v[1]))], "pixels": [im.width, im.height], "name": im.name })
+                        json!({ "image": i + 1, "rect": [r(u[0].min(v[0])), r(u[1].min(v[1])), r(u[0].max(v[0])), r(u[1].max(v[1]))], "pixels": [im.width, im.height], "name": im.name, "kind": if im.is_form { "form" } else { "image" } })
                     })
                     .collect();
                 json!({ "page": page + 1, "count": list.len(), "images": list })
@@ -326,13 +353,18 @@ impl Automation {
                 if name == "image_save" {
                     let (ext, bytes) = self.doc(&a)?.page_image_file(page, index).map_err(failed)?;
                     let mut path = self.resolve(a.str("path")?, true)?;
+                    if path.is_dir() {
+                        // Adding the extension to a folder's name would write beside it: "." is the
+                        // root, so that would land outside it.
+                        return Err(failed(format!("{}: is a folder, not a file", path.display())));
+                    }
                     if path.extension().is_none() {
                         path.set_extension(ext);
                     }
                     write_atomic(&path, &bytes)?;
                     json!({ "path": path.to_string_lossy(), "format": ext, "bytes": bytes.len() })
                 } else {
-                    use printcraft_engine::ImageEdit;
+                    use pdfcraft_engine::ImageEdit;
                     let change = match a.str("action")? {
                         "move" => {
                             let r: Vec<f64> =
@@ -392,7 +424,8 @@ impl Automation {
                 }
                 let block = self.doc(&a)?.text_blocks(page)[k as usize - 1].clone();
                 let text = a.opt_str("text")?.map(str::to_owned).unwrap_or(block.text);
-                let mut style = printcraft_engine::BlockStyle {
+                let mut style = pdfcraft_engine::BlockStyle {
+                    bold: a.opt_bool("bold")?,
                     size: a.opt_num("size")?,
                     underline: a.opt_bool("underline")?,
                     line_spacing: a.opt_num("line_spacing")?,
@@ -407,9 +440,9 @@ impl Automation {
                 }
                 if let Some(f) = a.opt_str("font")? {
                     let family = match f {
-                        "helvetica" => printcraft_engine::FontFamily::Helvetica,
-                        "times" => printcraft_engine::FontFamily::Times,
-                        "courier" => printcraft_engine::FontFamily::Courier,
+                        "helvetica" => pdfcraft_engine::FontFamily::Helvetica,
+                        "times" => pdfcraft_engine::FontFamily::Times,
+                        "courier" => pdfcraft_engine::FontFamily::Courier,
                         other => return Err(ToolError::InvalidArgs(format!("unknown font {other:?} (helvetica, times, courier)"))),
                     };
                     style.family = Some((family, a.opt_bool("bold")?.unwrap_or(false), a.opt_bool("italic")?.unwrap_or(false)));
@@ -419,10 +452,10 @@ impl Automation {
                 }
                 if let Some(al) = a.opt_str("align")? {
                     style.align = Some(match al {
-                        "left" => printcraft_engine::TextAlign::Left,
-                        "center" => printcraft_engine::TextAlign::Center,
-                        "right" => printcraft_engine::TextAlign::Right,
-                        "justify" => printcraft_engine::TextAlign::Justify,
+                        "left" => pdfcraft_engine::TextAlign::Left,
+                        "center" => pdfcraft_engine::TextAlign::Center,
+                        "right" => pdfcraft_engine::TextAlign::Right,
+                        "justify" => pdfcraft_engine::TextAlign::Justify,
                         other => return Err(ToolError::InvalidArgs(format!("unknown align {other:?}"))),
                     });
                 }
@@ -488,6 +521,7 @@ impl Automation {
             "redact_clear" => self.redact_clear(&a)?,
             "doc_hidden_info" => self.doc_hidden_info(&a)?,
             "printers" => self.printers()?,
+            "printer_options" => self.printer_options(&a)?,
             "link_list" => self.link_list(&a)?,
             "link_add" => self.link_add(&a)?,
             "link_edit" => self.link_edit(&a)?,
@@ -502,6 +536,15 @@ impl Automation {
             "doc_print" => self.doc_print(&a)?,
             "doc_remove_hidden" => self.doc_remove_hidden(&a)?,
             "fill_sign_add" => self.fill_sign_add(&a)?,
+            "fill_sign_date_format" => self.fill_sign_date_format(&a)?,
+            "measure_distance" => self.measurement_add(&a, pdfcraft_engine::measure::Kind::Distance)?,
+            "measure_perimeter" => self.measurement_add(&a, pdfcraft_engine::measure::Kind::Perimeter)?,
+            "measure_area" => self.measurement_add(&a, pdfcraft_engine::measure::Kind::Area)?,
+            "measure_info" => self.measurement_info(&a)?,
+            "measure_list" => self.measurement_list(&a)?,
+            "measure_scale" => self.measurement_scale(&a)?,
+            "measure_snap" => self.measurement_snap(&a)?,
+            "measure_export" => self.measurement_export(&a)?,
             "comment_list" => self.comment_list(&a)?,
             "comment_add" => self.comment_add(&a)?,
             "stamp_custom" => self.stamp_custom(&a)?,
@@ -537,12 +580,23 @@ impl Automation {
             "sign_document" => self.sign_document(&a)?,
             "sign_keychain_ids" => {
                 #[cfg(target_os = "macos")]
-                let ids: Vec<Value> = printcraft_engine::sign::keychain::identities(None)
+                let ids: Vec<Value> = pdfcraft_engine::sign::keychain::identities(None)
                     .map_err(failed)?
                     .iter()
-                    .map(|id| json!({ "id": printcraft_engine::sign::keychain::reference(&id.certificate), "certificate": signing::cert_json(&id.certificate) }))
+                    .map(|id| json!({ "id": pdfcraft_engine::sign::keychain::reference(&id.certificate), "certificate": signing::cert_json(&id.certificate) }))
                     .collect();
                 #[cfg(not(target_os = "macos"))]
+                let ids: Vec<Value> = Vec::new();
+                json!({ "count": ids.len(), "ids": ids })
+            }
+            "sign_windows_ids" => {
+                #[cfg(target_os = "windows")]
+                let ids: Vec<Value> = pdfcraft_engine::sign::windows::identities()
+                    .map_err(failed)?
+                    .iter()
+                    .map(|id| json!({ "id": pdfcraft_engine::sign::windows::reference(&id.certificate), "certificate": signing::cert_json(&id.certificate) }))
+                    .collect();
+                #[cfg(not(target_os = "windows"))]
                 let ids: Vec<Value> = Vec::new();
                 json!({ "count": ids.len(), "ids": ids })
             }
@@ -578,7 +632,8 @@ impl Automation {
     fn doc_close(&mut self, a: &Args) -> Result<Value> {
         let doc = self.doc(a)?;
         let id = doc.id;
-        if doc.dirty && !a.opt_bool("discard_changes")?.unwrap_or(false) {
+        let discard_changes = a.opt_bool("discard_changes")?.unwrap_or(false);
+        if doc.dirty && !discard_changes {
             return Err(failed("the document has unsaved changes: save it with doc_save, or pass discard_changes: true"));
         }
         self.session.close(id);
@@ -597,6 +652,10 @@ impl Automation {
         let same_file = doc.path.as_deref().is_some_and(|p| Path::new(p) == target);
         // Saving to a new file is a full rewrite unless asked otherwise, like Save As.
         let full = a.opt_bool("full")?.unwrap_or(!same_file);
+        let flatten_fill_sign = a.opt_bool("flatten_fill_sign")?.unwrap_or(false);
+        if flatten_fill_sign {
+            self.apply(a, Edit::FlattenFillSign)?;
+        }
         let bytes = if full { self.session.save_full_bytes(id) } else { self.session.save_bytes(id) }.map_err(failed)?;
         write_atomic(&target, &bytes)?;
         let path = target.to_string_lossy().into_owned();
@@ -623,7 +682,7 @@ impl Automation {
     }
 
     fn doc_initial_view(&mut self, a: &Args) -> Result<Value> {
-        use printcraft_engine::{InitialLayout as L, Magnification as M, Navigation as N};
+        use pdfcraft_engine::{InitialLayout as L, Magnification as M, Navigation as N};
         let bad = |m: String| ToolError::InvalidArgs(m);
         let mut v = self.doc(a)?.initial_view();
         let before = v.clone();
@@ -711,7 +770,7 @@ impl Automation {
     }
 
     fn doc_optimize(&mut self, a: &Args) -> Result<Value> {
-        use printcraft_engine::optimize::{Compression, ImageSettings, Settings};
+        use pdfcraft_engine::optimize::{Compression, ImageSettings, Settings};
         let id = self.doc(a)?.id;
         let before = self.doc(a)?.bytes.len();
         let path = self.resolve(a.str("path")?, true)?;
@@ -755,7 +814,7 @@ impl Automation {
                 *flag = b;
             }
         }
-        let discard: Vec<printcraft_engine::Hidden> = match a.get("discard") {
+        let discard: Vec<pdfcraft_engine::Hidden> = match a.get("discard") {
             None => Vec::new(),
             Some(v) => v
                 .as_array()
@@ -763,7 +822,7 @@ impl Automation {
                 .iter()
                 .map(|x| {
                     x.as_str()
-                        .and_then(printcraft_engine::Hidden::from_id)
+                        .and_then(pdfcraft_engine::Hidden::from_id)
                         .ok_or_else(|| ToolError::InvalidArgs(format!("unknown discard category {x}")))
                 })
                 .collect::<Result<_>>()?,
@@ -793,12 +852,12 @@ impl Automation {
     }
 
     /// A watermark or background picture: `file` (an image or a PDF) and `file_page` (1-based).
-    fn mark_file(&self, a: &Args) -> Result<Option<printcraft_engine::MarkFile>> {
+    fn mark_file(&self, a: &Args) -> Result<Option<pdfcraft_engine::MarkFile>> {
         let Some(p) = a.opt_str("file")? else { return Ok(None) };
         let path = self.resolve(p, false)?;
         let bytes = std::fs::read(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
         let page = a.opt_int("file_page")?.unwrap_or(1).max(1) as usize - 1;
-        Ok(Some(printcraft_engine::MarkFile {
+        Ok(Some(pdfcraft_engine::MarkFile {
             name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             bytes: Arc::new(bytes),
             page,
@@ -812,7 +871,7 @@ impl Automation {
     }
 
     fn marks(&mut self, tool: &str, a: &Args) -> Result<Value> {
-        use printcraft_engine::{Background, HeaderFooter, MarkKind, Watermark};
+        use pdfcraft_engine::{Background, HeaderFooter, MarkKind, Watermark};
         let n = self.doc(a)?.info.pages.len();
         let pages = match a.opt_ints("pages")? {
             Some(_) => self.pages(a, "pages")?,
@@ -891,7 +950,7 @@ impl Automation {
             None => (0..doc.info.pages.len()).collect(),
         };
         let stem = doc.name.trim_end_matches(".pdf").trim_end_matches(".PDF").to_string();
-        let mut ex = printcraft_engine::export::Exporter::new(doc);
+        let mut ex = pdfcraft_engine::export::Exporter::new(doc);
         if tool == "doc_export_text" {
             let path = self.resolve(a.str("path")?, true)?;
             let text = ex.text_of(&pages).map_err(failed)?;
@@ -902,10 +961,10 @@ impl Automation {
         std::fs::create_dir_all(&folder).map_err(|e| failed(format!("{}: {e}", folder.display())))?;
         if tool == "doc_export_all_images" {
             let min = u32::try_from(a.opt_int("min_size")?.unwrap_or(0).max(0)).unwrap_or(u32::MAX);
-            let out = printcraft_engine::export::extract_images(&doc.export_source(), &pages, min).map_err(failed)?;
+            let out = pdfcraft_engine::export::extract_images(&doc.export_source(), &pages, min).map_err(failed)?;
             let mut files = Vec::new();
             for (k, img) in out.images.iter().enumerate() {
-                let path = folder.join(printcraft_engine::export::image_file_name(&stem, img, k + 1));
+                let path = child(&folder, &pdfcraft_engine::export::image_file_name(&stem, img, k + 1));
                 write_atomic(&path, &img.data)?;
                 files.push(json!({ "path": path.to_string_lossy(), "page": img.page + 1, "width": img.width, "height": img.height }));
             }
@@ -915,15 +974,15 @@ impl Automation {
         let dpi = a.opt_num("dpi")?.unwrap_or(150.0);
         let quality = a.opt_int("quality")?.unwrap_or(85).clamp(1, 100) as u8;
         let format = match a.opt_str("format")?.unwrap_or("png") {
-            "png" => printcraft_engine::export::ImageFormat::Png,
-            "jpeg" | "jpg" => printcraft_engine::export::ImageFormat::Jpeg { quality },
-            "tiff" | "tif" => printcraft_engine::export::ImageFormat::Tiff,
+            "png" => pdfcraft_engine::export::ImageFormat::Png,
+            "jpeg" | "jpg" => pdfcraft_engine::export::ImageFormat::Jpeg { quality },
+            "tiff" | "tif" => pdfcraft_engine::export::ImageFormat::Tiff,
             f => return Err(ToolError::InvalidArgs(format!("unknown format {f:?} (png, jpeg, tiff)"))),
         };
         let mut files = Vec::new();
         for p in pages {
             let img = ex.image(p, dpi, format).map_err(failed)?;
-            let path = folder.join(format!("{stem}_page_{}.{}", p + 1, format.extension()));
+            let path = child(&folder, &format!("{stem}_page_{}.{}", p + 1, format.extension()));
             write_atomic(&path, &img)?;
             files.push(path.to_string_lossy().into_owned());
         }
@@ -938,6 +997,7 @@ impl Automation {
                 ("Untitled.pdf".to_string(), self.session.create_blank(w, h, n).map_err(failed)?)
             }
             "images" => {
+                let resolution = a.opt_num("dpi")?.map_or(pdfcraft_engine::ImageResolution::Embedded, pdfcraft_engine::ImageResolution::Dpi);
                 let mut images = Vec::new();
                 for p in a.strs("paths")? {
                     let path = self.resolve(p, false)?;
@@ -949,7 +1009,7 @@ impl Automation {
                 } else {
                     "Images.pdf".into()
                 };
-                (name, self.session.create_from_images(&images).map_err(failed)?)
+                (name, self.session.create_from_images_with_resolution(&images, resolution).map_err(failed)?)
             }
             "text" => {
                 let (title, text) = match (a.opt_str("text")?, a.opt_str("path")?) {
@@ -971,7 +1031,7 @@ impl Automation {
     }
 
     fn page_set_box(&mut self, a: &Args) -> Result<Value> {
-        use printcraft_engine::{BoxSpec, PageBox};
+        use pdfcraft_engine::{BoxSpec, PageBox};
         let doc = self.doc(a)?;
         let n = doc.info.pages.len();
         let pages = match a.opt_ints("pages")? {
@@ -1010,8 +1070,17 @@ impl Automation {
     }
 
     fn doc_protect(&mut self, a: &Args) -> Result<Value> {
-        use printcraft_engine::{Algorithm, Changes, Printing, Protection};
+        use pdfcraft_engine::{Algorithm, Changes, Printing, Protection};
         let d = Protection::default();
+        // Restrictions only exist behind a permissions password (ISO 32000-2 §7.6.4.4: /P is
+        // enforced against the owner password; without one everything stays allowed). Refuse a
+        // restriction that could not take effect instead of writing an unrestricted file (#134).
+        let restriction = ["printing", "changes", "copy", "accessibility"].into_iter().find(|k| a.get(k).is_some());
+        if let (None, Some(key)) = (a.opt_str("permissions_password")?, restriction) {
+            return Err(ToolError::InvalidArgs(format!(
+                "`{key}` needs `permissions_password`: with open_password alone the document is encrypted but nothing is restricted"
+            )));
+        }
         let p = Protection {
             open_password: a.opt_str("open_password")?.map(str::to_owned),
             permissions_password: a.opt_str("permissions_password")?.map(str::to_owned),
@@ -1086,6 +1155,63 @@ impl Automation {
         Ok(result)
     }
 
+    fn doc_create_multiple(&mut self, a: &Args) -> Result<Value> {
+        let paths = a.strs("paths")?;
+        if paths.is_empty() || paths.len() > pdfcraft_engine::MAX_CREATE_FILES {
+            return Err(ToolError::InvalidArgs(format!("paths must list 1 to {} files", pdfcraft_engine::MAX_CREATE_FILES)));
+        }
+        let separate = match a.opt_str("mode")? {
+            None | Some("combine") => false,
+            Some("separate") => true,
+            Some(m) => return Err(ToolError::InvalidArgs(format!("mode must be \"combine\" or \"separate\", not {m:?}"))),
+        };
+        if separate {
+            return self.create_separate(a, &paths);
+        }
+        let ranges: Vec<Option<String>> = match a.get("pages") {
+            None | Some(Value::Null) => vec![None; paths.len()],
+            Some(Value::Array(v)) if v.len() == paths.len() => v.iter().map(|x| x.as_str().map(str::to_owned)).collect(),
+            Some(_) => return Err(ToolError::InvalidArgs("pages must list a range (or null) for each path".into())),
+        };
+        let mut sources = Vec::new();
+        for (p, range) in paths.into_iter().zip(ranges) {
+            let path = self.resolve(p, false)?;
+            let bytes = std::fs::read(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let (_, pdf) = self.session.convert_to_pdf(&name, &Arc::new(bytes)).map_err(failed)?;
+            let title = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            sources.push((title, pdf, range));
+        }
+        let bytes = self.session.combine_ranges(&sources).map_err(failed)?;
+        self.deliver(a, "Combined", bytes)
+    }
+
+    /// One PDF per file, written into `out_dir`; a file that fails doesn't stop the others.
+    fn create_separate(&mut self, a: &Args, paths: &[&str]) -> Result<Value> {
+        let dir = self.resolve(a.str("out_dir").map_err(|_| ToolError::InvalidArgs("mode \"separate\" needs out_dir".into()))?, true)?;
+        std::fs::create_dir_all(&dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
+        let mut out = Vec::new();
+        for &p in paths {
+            let converted = self.resolve(p, false).map_err(|e| e.to_string()).and_then(|src| {
+                let bytes = std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))?;
+                let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let stem = src.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+                let (kind, pdf) = self.session.convert_to_pdf(&name, &Arc::new(bytes)).map_err(|e| e.to_string())?;
+                Ok((kind, stem, pdf))
+            });
+            out.push(match converted {
+                Ok((pdfcraft_engine::SourceKind::Pdf, ..)) => json!({ "path": p, "skipped": "already a PDF" }),
+                Ok((_, stem, pdf)) => {
+                    let target = unused(&dir, &stem);
+                    write_atomic(&target, &pdf)?;
+                    json!({ "path": p, "output": target.to_string_lossy(), "bytes": pdf.len() })
+                }
+                Err(e) => json!({ "path": p, "error": e }),
+            });
+        }
+        Ok(json!({ "files": out }))
+    }
+
     fn page_extract(&mut self, a: &Args) -> Result<Value> {
         let doc = self.doc(a)?;
         let (id, name) = (doc.id, format!("{} (extract)", doc.name));
@@ -1098,7 +1224,7 @@ impl Automation {
             let mut files = Vec::new();
             for &p in &pages {
                 let bytes = self.session.extract(id, &[p]).map_err(failed)?;
-                let path = dir.join(format!("{stem}-page{}.pdf", p + 1));
+                let path = child(&dir, &format!("{stem}-page{}.pdf", p + 1));
                 write_atomic(&path, &bytes)?;
                 files.push(path.to_string_lossy().into_owned());
             }
@@ -1121,8 +1247,23 @@ impl Automation {
         }
         let ranges: Vec<Option<String>> = match a.get("pages") {
             None | Some(Value::Null) => vec![None; paths.len()],
-            Some(Value::Array(v)) if v.len() == paths.len() => v.iter().map(|x| x.as_str().map(str::to_owned)).collect(),
+            Some(Value::Array(v)) if v.len() == paths.len() => v
+                .iter()
+                .enumerate()
+                .map(|(index, value)| match value {
+                    Value::Null => Ok(None),
+                    Value::String(range) => Ok(Some(range.clone())),
+                    _ => Err(ToolError::InvalidArgs(format!("pages[{index}] must be a range string or null"))),
+                })
+                .collect::<Result<_>>()?,
             Some(_) => return Err(ToolError::InvalidArgs("pages must list a range (or null) for each path".into())),
+        };
+        let passwords: Vec<Option<String>> = match a.get("passwords") {
+            None | Some(Value::Null) => vec![None; paths.len()],
+            Some(Value::Array(v)) if v.len() == paths.len() && v.iter().all(|x| x.is_string() || x.is_null()) => {
+                v.iter().map(|x| x.as_str().map(str::to_owned)).collect()
+            }
+            Some(_) => return Err(ToolError::InvalidArgs("passwords must list a password (or null) for each path".into())),
         };
         let mut sources = Vec::new();
         for (p, range) in paths.into_iter().zip(ranges) {
@@ -1131,7 +1272,8 @@ impl Automation {
             let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             sources.push((name, Arc::new(bytes), range));
         }
-        let bytes = self.session.combine_ranges(&sources).map_err(failed)?;
+        let passwords: Vec<Option<&str>> = passwords.iter().map(Option::as_deref).collect();
+        let bytes = self.session.combine_unlocked(&sources, &passwords).map_err(failed)?;
         self.deliver(a, "Combined", bytes)
     }
 
@@ -1155,14 +1297,14 @@ impl Automation {
             self.session.split_by_size(id, (mb * 1_048_576.0) as usize).map_err(failed)?
         } else {
             let by = match (a.opt_int("every")?, a.opt_ints("before")?) {
-                (Some(n), None) if n > 0 => printcraft_organize::SplitBy::PageCount(n as usize),
-                (None, Some(b)) => printcraft_organize::SplitBy::Before(one_based(&b)?),
+                (Some(n), None) if n > 0 => pdfcraft_organize::SplitBy::PageCount(n as usize),
+                (None, Some(b)) => pdfcraft_organize::SplitBy::Before(one_based(&b)?),
                 _ if bookmarks => {
                     titles = self.session.bookmark_splits(id);
                     if titles.is_empty() {
                         return Err(failed("the document has no top-level bookmarks"));
                     }
-                    printcraft_organize::SplitBy::Before(titles.iter().map(|t| t.0).collect())
+                    pdfcraft_organize::SplitBy::Before(titles.iter().map(|t| t.0).collect())
                 }
                 _ => return Err(ToolError::InvalidArgs("every must be a positive page count".into())),
             };
@@ -1177,7 +1319,7 @@ impl Automation {
                 Some((_, t)) => format!("{stem}-{}.pdf", safe(t)),
                 None => format!("{stem}-part{}.pdf", i + 1),
             };
-            let path = dir.join(file);
+            let path = child(&dir, &file);
             write_atomic(&path, bytes)?;
             files.push(json!({ "path": path.to_string_lossy(), "first_page": first, "last_page": last }));
         }
@@ -1213,10 +1355,10 @@ impl Automation {
         let doc = self.session.get(id).ok_or_else(|| failed("no such document"))?;
         let fresh = || {
             let config = RenderConfig { password: doc.password.as_deref().map(Arc::from), ..Default::default() };
-            (doc.bytes.clone(), PageRenderer::new(doc.bytes.clone(), config))
+            (doc.display.clone(), PageRenderer::new(doc.display.clone(), config))
         };
         let entry = self.renderers.entry(id).or_insert_with(fresh);
-        if !Arc::ptr_eq(&entry.0, &doc.bytes) {
+        if !Arc::ptr_eq(&entry.0, &doc.display) {
             *entry = fresh();
         }
         Ok(&mut entry.1)
@@ -1302,6 +1444,8 @@ impl Automation {
             Some(_) => Some(self.doc(a)?.id),
             None => None,
         };
+        let filter = a.opt_str("filter")?.unwrap_or("").to_lowercase();
+        let enabled_only = a.opt_bool("enabled_only")?.unwrap_or(false);
         let list: Vec<Value> = commands::COMMANDS
             .iter()
             .map(|c| {
@@ -1312,7 +1456,16 @@ impl Automation {
                     "shortcut": c.shortcut.map(|s| s.label(cfg!(target_os = "macos"))),
                     "enabled": commands::is_enabled(c, &self.session, active),
                     "tool": tools::tool_for_command(c.id),
+                    "params": tools::tool_for_command(c.id).and_then(tools::find).map(|t| &t.input_schema),
                 })
+            })
+            .collect();
+        let list: Vec<Value> = list
+            .into_iter()
+            .filter(|c| {
+                (!enabled_only || c.get("enabled").and_then(Value::as_bool) == Some(true))
+                    && (filter.is_empty()
+                        || ["id", "label", "menu"].iter().any(|k| c.get(k).is_some_and(|v| v.to_string().to_lowercase().contains(&filter))))
             })
             .collect();
         Ok(json!({ "commands": list }))
@@ -1322,35 +1475,87 @@ impl Automation {
 
     /// Resolve a user-supplied path, enforcing the root (if any). `for_write` allows a file that
     /// does not exist yet (its nearest existing ancestor must be inside the root).
+    ///
+    /// Every path outside the root gets the same refusal, so a confined client can't learn what
+    /// exists out there (#136): `..` is resolved by name first, another network share or device
+    /// namespace is refused without touching it, and the deepest existing ancestor (links
+    /// followed) must be inside the root before anything about the rest is reported.
     fn resolve(&self, path: &str, for_write: bool) -> Result<PathBuf> {
         let p = Path::new(path);
-        let joined = match &self.root {
-            Some(root) if p.is_relative() => root.join(p),
-            _ => p.to_path_buf(),
-        };
-        let Some(root) = &self.root else { return Ok(joined) };
-        let real = if for_write {
-            // Canonicalize the deepest existing ancestor, then re-append the rest.
-            let mut existing = joined.as_path();
-            let mut rest = Vec::new();
-            while !existing.exists() {
-                rest.push(existing.file_name().ok_or_else(|| failed(format!("{path}: invalid path")))?);
-                existing = existing.parent().ok_or_else(|| failed(format!("{path}: invalid path")))?;
-            }
-            if rest.iter().any(|c| *c == "..") {
-                return Err(failed(format!("{path}: '..' is not allowed here")));
-            }
-            let mut real = existing.canonicalize().map_err(|e| failed(format!("{path}: {e}")))?;
-            real.extend(rest.iter().rev());
-            real
-        } else {
-            joined.canonicalize().map_err(|e| failed(format!("{path}: {e}")))?
-        };
-        if !real.starts_with(root) {
-            return Err(failed(format!("{path} is outside the allowed directory {}", root.display())));
+        let Some(root) = &self.root else { return Ok(p.to_path_buf()) };
+        let outside = || failed(format!("{path} is outside the allowed directory {}", root.display()));
+        let joined = lexical(&root.join(p)).ok_or_else(outside)?;
+        if foreign_share(&joined, root) {
+            return Err(outside());
         }
+        let mut existing = joined.as_path();
+        let mut rest = Vec::new();
+        while !existing.exists() {
+            if existing.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(outside()); // a broken link: going on would tell whether its target exists
+            }
+            match (existing.file_name(), existing.parent()) {
+                (Some(name), Some(parent)) => {
+                    rest.push(name);
+                    existing = parent;
+                }
+                _ => return Err(outside()), // not even a drive or share that exists
+            }
+        }
+        let mut real = existing.canonicalize().map_err(|_| outside())?;
+        if !real.starts_with(root) {
+            return Err(outside());
+        }
+        if !rest.is_empty() && !for_write {
+            // Missing, below a folder inside the root: say why, as the system reports it.
+            real = joined.canonicalize().map_err(|e| failed(format!("{path}: {e}")))?;
+            if !real.starts_with(root) {
+                return Err(outside()); // it appeared, as a link out, since the check above
+            }
+            return Ok(real);
+        }
+        real.extend(rest.iter().rev());
         Ok(real)
     }
+}
+
+/// `path` with `.` and `..` resolved by name, before the filesystem is consulted (Windows does
+/// the same, and so does joining onto a canonical root there). `None` if a `..` would climb
+/// above the start of the path.
+fn lexical(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut parts: Vec<Component> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match parts.last() {
+                Some(Component::Normal(_)) => {
+                    parts.pop();
+                }
+                _ => return None,
+            },
+            other => parts.push(other),
+        }
+    }
+    Some(parts.iter().collect())
+}
+
+/// Whether `path` names another network share or device namespace than `root` (Windows
+/// `\\host\share`, `\\?\UNC\…`, `\\.\…`, `\\?\…`). Those are refused by name: even checking
+/// that one exists would contact the host. Drive letters are left to the normal check.
+fn foreign_share(path: &Path, root: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    fn share(p: &Path) -> Option<String> {
+        let Some(Component::Prefix(prefix)) = p.components().next() else { return None };
+        let (kind, a, b) = match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => return None,
+            Prefix::UNC(host, share) | Prefix::VerbatimUNC(host, share) => ("unc", host, share),
+            Prefix::DeviceNS(name) => ("device", name, std::ffi::OsStr::new("")),
+            Prefix::Verbatim(name) => ("verbatim", name, std::ffi::OsStr::new("")),
+        };
+        Some(format!("{kind}\\{}\\{}", a.to_string_lossy(), b.to_string_lossy()).to_lowercase())
+    }
+    share(path).is_some_and(|s| share(root).as_ref() != Some(&s))
 }
 
 // ---- JSON helpers ----------------------------------------------------------------------------
@@ -1414,7 +1619,7 @@ impl Args<'_> {
 }
 
 /// The bookmark tree as JSON, with 1-based paths and pages.
-fn bookmark_tree(items: &[printcraft_render::OutlineItem], parent: &[usize]) -> Vec<Value> {
+fn bookmark_tree(items: &[pdfcraft_render::OutlineItem], parent: &[usize]) -> Vec<Value> {
     items
         .iter()
         .enumerate()
@@ -1482,27 +1687,45 @@ fn info(d: &Document) -> Value {
         "creator": i.creator, "producer": i.producer,
         "tagged": i.tagged,
         "has_javascript": i.has_javascript,
-        // XFA forms aren't read yet: "static" (fields work, XFA data ignored) or "dynamic" (placeholder pages).
-        "xfa": i.xfa.map(|x| match x { printcraft_render::Xfa::Static => "static", printcraft_render::Xfa::Dynamic => "dynamic" }),
+        // XFA forms: "static" (the PDF's own fields work; the XFA data is ignored) or "dynamic"
+        // (laid out from the template by PdfCraft, see xfa_layout; placeholder pages when that failed).
+        "xfa": i.xfa.map(|x| match x { pdfcraft_render::Xfa::Static => "static", pdfcraft_render::Xfa::Dynamic => "dynamic" }),
+        "xfa_layout": d.xfa.as_ref().map(|x| json!({ "pages": x.pages, "fields": x.fields, "warnings": x.warnings })),
+        // What was rewritten from, or could not be written to, the XFA data.
+        "xfa_warnings": d.xfa_warnings,
         "security": security,
         "pages": i.pages.iter().enumerate().map(|(n, p)| json!({
             "page": n + 1, "label": p.label, "width": p.width, "height": p.height, "rotation": p.rotation,
         })).collect::<Vec<_>>(),
         "outline": outline(&i.outline),
+        // Rectangles use the tools' convention (top-left of the displayed page, like
+        // comment_list and link_list), not raw PDF user space, so they can be fed back to
+        // geometry-taking tools (#129).
         "annotations": i.annotations.iter().map(|a| json!({
             "page": page1(a.page), "type": a.subtype, "author": a.author, "contents": a.contents,
-            "modified": a.modified, "name": a.name, "in_reply_to": a.in_reply_to, "rect": a.rect,
+            "modified": a.modified, "name": a.name, "in_reply_to": a.in_reply_to, "rect": view_rect(i, a.page, a.rect),
         })).collect::<Vec<_>>(),
         "fields": i.fields.iter().map(|f| json!({
             "name": f.name, "kind": format!("{:?}", f.kind), "value": f.value, "page": f.page.map(page1),
             "tooltip": f.tooltip, "has_actions": f.has_actions,
         })).collect::<Vec<_>>(),
         "links": i.links.iter().map(|l| json!({
-            "page": page1(l.page), "rect": l.rect,
+            "page": page1(l.page), "rect": view_rect(i, l.page, l.rect),
             "target": match &l.target {
-                printcraft_render::LinkTarget::Page(p) => json!({ "page": page1(*p) }),
-                printcraft_render::LinkTarget::Uri(u) => json!({ "uri": u }),
-                printcraft_render::LinkTarget::Other(o) => json!({ "other": o }),
+                pdfcraft_render::LinkTarget::Page(p, _) => json!({ "page": page1(*p) }),
+                pdfcraft_render::LinkTarget::Uri(u) => json!({ "uri": u }),
+                pdfcraft_render::LinkTarget::SetLayers { changes, preserve_rb } => json!({
+                    "layers": changes.iter().map(|(op, ocg)| json!({
+                        "layer": i.layers.iter().find(|l| l.id == *ocg).map(|l| l.name.as_str()),
+                        "state": match op {
+                            pdfcraft_render::LayerOp::On => "on",
+                            pdfcraft_render::LayerOp::Off => "off",
+                            pdfcraft_render::LayerOp::Toggle => "toggle",
+                        },
+                    })).collect::<Vec<_>>(),
+                    "preserve_rb": preserve_rb,
+                }),
+                pdfcraft_render::LinkTarget::Other(o) => json!({ "other": o }),
             },
         })).collect::<Vec<_>>(),
         "layers": i.layers.iter().map(|l| json!({ "name": l.name, "visible": l.visible })).collect::<Vec<_>>(),
@@ -1515,7 +1738,13 @@ fn info(d: &Document) -> Value {
     })
 }
 
-fn outline(items: &[printcraft_render::OutlineItem]) -> Value {
+/// A user-space rectangle on 0-based `page` in displayed-page coordinates; unchanged when the
+/// page is unknown (a malformed annotation that points at no page).
+fn view_rect(i: &pdfcraft_render::DocInfo, page: usize, rect: [f32; 4]) -> [f32; 4] {
+    i.pages.get(page).map_or(rect, |p| comments::rect_to_view(p, rect))
+}
+
+fn outline(items: &[pdfcraft_render::OutlineItem]) -> Value {
     Value::Array(items.iter().map(|o| json!({ "title": o.title, "page": o.page.map(|p| p + 1), "children": outline(&o.children) })).collect())
 }
 
@@ -1577,15 +1806,266 @@ fn extract_parallel(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[u
     out
 }
 
+/// The file `name` inside `dir`, where `name` comes from a document or an argument: separators,
+/// colons (a Windows drive or stream) and control characters become `_`, and a name of only dots
+/// gets a leading `_`, so it is one plain file name and can't lead out of `dir`.
+fn child(dir: &Path, name: &str) -> PathBuf {
+    let mut safe: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':') || c.is_control() { '_' } else { c }).collect();
+    if safe.chars().all(|c| c == '.') {
+        safe.insert(0, '_');
+    }
+    dir.join(safe)
+}
+
+/// `<stem>.pdf` in `dir`, or `<stem> (2).pdf` and so on when that name is taken.
+fn unused(dir: &Path, stem: &str) -> PathBuf {
+    let first = child(dir, &format!("{stem}.pdf"));
+    if !first.exists() {
+        return first;
+    }
+    (2..10_000u32).map(|n| child(dir, &format!("{stem} ({n}).pdf"))).find(|p| !p.exists()).unwrap_or(first)
+}
+
 /// Write via a temporary file in the same directory, then rename over the target.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with(path, bytes, staging_suffixes())
+}
+
+/// [`write_atomic`], trying the staging names that `suffixes` give.
+fn write_atomic_with(path: &Path, bytes: &[u8], suffixes: impl IntoIterator<Item = u64>) -> Result<()> {
+    use std::io::Write;
+    // A folder can't be replaced, and staging beside it could land outside the root: "." names
+    // the root itself, whose parent isn't ours to write in.
+    if path.is_dir() {
+        return Err(failed(format!("{}: is a folder, not a file", path.display())));
+    }
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path.file_name().ok_or_else(|| failed(format!("{}: not a file path", path.display())))?;
     std::fs::create_dir_all(dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
-    let tmp = dir.join(format!(".{}.printcraft-tmp", name.to_string_lossy()));
-    std::fs::write(&tmp, bytes).map_err(|e| failed(format!("{}: {e}", tmp.display())))?;
+    let (tmp, file) =
+        create_staging(dir, &name.to_string_lossy(), StagingName::SuffixThenTag, suffixes).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
+    // Closed at the end of the block, before the rename.
+    let written = {
+        let mut file = file;
+        file.write_all(bytes)
+    };
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(failed(format!("{}: {e}", tmp.display())));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         failed(format!("{}: {e}", path.display()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdfcraft_platform::staging::STAGING_ATTEMPTS;
+
+    #[test]
+    fn dot_dot_resolves_by_name_and_never_climbs_above_the_start() {
+        let base = std::env::temp_dir();
+        let l = |rel: &str| lexical(&base.join(rel));
+        assert_eq!(l("a/./b/../c"), Some(base.join("a").join("c")));
+        assert_eq!(l("missing/../../x"), lexical(&base.join("..").join("x")));
+        assert_eq!(l("a/.."), Some(lexical(&base).unwrap()));
+        let deep = "../".repeat(base.components().count() + 1);
+        assert_eq!(lexical(&base.join(&deep)), None);
+        assert_eq!(lexical(Path::new("..")), None);
+    }
+
+    #[test]
+    fn names_from_documents_become_one_plain_file_name() {
+        let dir = std::env::temp_dir().join("out");
+        for name in ["../../x.png", "/abs/x.png", r"..\..\x.png", "C:x.png", r"\\host\share\x.png", "a:stream", "..", ".", "", "tab\there", "ok.png"]
+        {
+            let p = child(&dir, name);
+            assert_eq!(p.parent(), Some(dir.as_path()), "{name:?} -> {}", p.display());
+            assert_eq!(p.components().count(), dir.components().count() + 1, "{name:?} -> {}", p.display());
+        }
+        assert_eq!(child(&dir, "ok.png"), dir.join("ok.png"));
+        assert_eq!(child(&dir, "../x.png"), dir.join(".._x.png"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn other_shares_and_device_paths_are_refused_by_name() {
+        let local = Path::new(r"\\?\C:\work\root");
+        for p in [
+            r"\\host\share\x.pdf",
+            "//host/share/x.pdf",
+            r"\/host/share/x.pdf",
+            r"\\?\UNC\host\share\x.pdf",
+            r"\\.\pipe\x",
+            r"\\.\C:\work\root\x.pdf",
+            r"\\?\GLOBALROOT\Device\x",
+        ] {
+            assert!(foreign_share(Path::new(p), local), "{p}");
+        }
+        for p in [r"C:\work\root\x.pdf", r"c:\elsewhere\x.pdf", r"\\?\C:\work\root\x.pdf", r"D:\x.pdf", r"C:x.pdf"] {
+            assert!(!foreign_share(Path::new(p), local), "{p}");
+        }
+        // A root on a share accepts that share, however it is spelled, and nothing else.
+        let shared = Path::new(r"\\?\UNC\Server\Docs\root");
+        assert!(!foreign_share(Path::new(r"\\server\docs\root\x.pdf"), shared));
+        assert!(!foreign_share(Path::new(r"\\?\UNC\SERVER\DOCS\x.pdf"), shared));
+        assert!(foreign_share(Path::new(r"\\server\other\x.pdf"), shared));
+        assert!(foreign_share(Path::new(r"\\attacker\docs\x.pdf"), shared));
+    }
+
+    /// A fresh, empty folder for one staging test.
+    fn staging_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-staging-{}-{test}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn staged(dir: &Path, suffix: u64) -> PathBuf {
+        dir.join(format!(".out.pdf.{suffix:016x}.pdfcraft-tmp"))
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    /// A symbolic link to a file, where the system allows one (Windows needs Developer Mode or an
+    /// administrator for it).
+    fn file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::other(format!("no symbolic links here: {} {}", target.display(), link.display())))
+        }
+    }
+
+    #[test]
+    fn staging_never_writes_through_a_file_planted_at_its_name() {
+        let dir = staging_dir("planted");
+        // A file elsewhere that a planted link points at.
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "PRECIOUS").unwrap();
+        let target = dir.join("out.pdf");
+        // A hard link needs no privileges on any system, and writing to it writes to `outside`.
+        std::fs::hard_link(&outside, staged(&dir, 1)).unwrap();
+        std::fs::write(staged(&dir, 2), "PLANTED").unwrap();
+        write_atomic_with(&target, b"NEW", [1, 2, 3]).unwrap();
+        assert_eq!(read(&target), "NEW");
+        assert_eq!(read(&outside), "PRECIOUS");
+        assert_eq!(read(&staged(&dir, 1)), "PRECIOUS");
+        assert_eq!(read(&staged(&dir, 2)), "PLANTED");
+        assert!(!staged(&dir, 3).exists(), "the staging file was renamed into place");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_never_writes_through_a_symbolic_link_planted_at_its_name() {
+        let dir = staging_dir("symlink");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "PRECIOUS").unwrap();
+        let target = dir.join("out.pdf");
+        if let Err(e) = file_symlink(&outside, &staged(&dir, 1)) {
+            eprintln!("symbolic links not checked: {e}");
+            return;
+        }
+        write_atomic_with(&target, b"NEW", [1, 2]).unwrap();
+        assert_eq!(read(&target), "NEW");
+        assert_eq!(read(&outside), "PRECIOUS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_never_creates_a_file_through_a_dangling_link_at_its_name() {
+        let dir = staging_dir("dangling");
+        let unborn = dir.join("created-through-a-link.txt");
+        let target = dir.join("out.pdf");
+        if let Err(e) = file_symlink(&unborn, &staged(&dir, 1)) {
+            eprintln!("symbolic links not checked: {e}");
+            return;
+        }
+        write_atomic_with(&target, b"NEW", [1, 2]).unwrap();
+        assert_eq!(read(&target), "NEW");
+        assert!(!unborn.exists(), "nothing was created through the dangling link");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_gives_up_rather_than_reuse_a_taken_name() {
+        let dir = staging_dir("taken");
+        let target = dir.join("out.pdf");
+        std::fs::write(&target, "OLD").unwrap();
+        for s in 1..=STAGING_ATTEMPTS as u64 {
+            std::fs::write(staged(&dir, s), "PLANTED").unwrap();
+        }
+        assert!(write_atomic_with(&target, b"NEW", 1..).is_err());
+        assert_eq!(read(&target), "OLD");
+        for s in 1..=STAGING_ATTEMPTS as u64 {
+            assert_eq!(read(&staged(&dir, s)), "PLANTED");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The names in a folder: what a test can see was left behind.
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn staging_names_differ_between_saves_and_fit_long_names() {
+        let suffixes: std::collections::HashSet<u64> = staging_suffixes().take(64).collect();
+        assert_eq!(suffixes.len(), 64);
+        assert_ne!(staging_suffixes().next(), staging_suffixes().next(), "each save draws new names");
+        // 60 four-byte characters: a 244-byte name, within every system's limit. Its staging name
+        // must be too (on Linux the whole name in it would be 275 bytes).
+        let dir = staging_dir("long");
+        let name = format!("{}.pdf", "\u{1F600}".repeat(60));
+        write_atomic(&dir.join(&name), b"NEW").unwrap();
+        assert_eq!(read(&dir.join(&name)), "NEW");
+        assert_eq!(listing(&dir), [name], "no staging file is left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_at_the_staging_name_is_left_alone() {
+        let dir = staging_dir("folder");
+        std::fs::create_dir(staged(&dir, 1)).unwrap();
+        std::fs::write(staged(&dir, 1).join("inside.txt"), "PLANTED").unwrap();
+        let target = dir.join("out.pdf");
+        write_atomic_with(&target, b"NEW", [1, 2]).unwrap();
+        assert_eq!(read(&target), "NEW");
+        assert_eq!(read(&staged(&dir, 1).join("inside.txt")), "PLANTED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows refuses to replace a read-only file, so the rename fails: the staging file must not
+    /// be left behind.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_rename_removes_the_staging_file() {
+        let dir = staging_dir("readonly");
+        let target = dir.join("out.pdf");
+        std::fs::write(&target, "OLD").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms.clone()).unwrap();
+        let e = write_atomic_with(&target, b"NEW", [7]).unwrap_err();
+        assert!(e.to_string().contains(&target.display().to_string()), "the rename failed, not the staging: {e}");
+        assert_eq!(read(&target), "OLD");
+        assert_eq!(listing(&dir), ["out.pdf"], "the staging file was removed");
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&target, perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
