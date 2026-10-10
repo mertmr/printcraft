@@ -271,6 +271,15 @@ fn line_ending_properties_change_and_undo() {
     h.state_mut().open_comment_props(0, 0);
     h.run_steps(2);
     h.get_by_label("Line ending");
+    h.query_all_by_value("None").next().expect("start ending").click();
+    h.run_steps(2);
+    for label in ["Open arrow", "Closed arrow", "Butt", "Reverse open arrow", "Reverse closed arrow", "Slash", "Square", "Circle", "Diamond"] {
+        h.get_by_label(label);
+    }
+    assert_eq!(h.query_all_by_label("ROpenArrow").count(), 0);
+    assert_eq!(h.query_all_by_label("OpenArrow").count(), 0);
+    h.get_by_label("None").click();
+    h.run_steps(1);
     {
         let d = h.state_mut().comment_props.as_mut().expect("open");
         assert_eq!(d.edited.endings.as_deref(), Some(&[pdfcraft_engine::LineEnding::None, pdfcraft_engine::LineEnding::None][..]));
@@ -528,6 +537,13 @@ fn make_current_properties_default() {
     h.run_steps(3);
     let st = h.state().comment_prefs.style(pdfcraft_ui_egui::comments::CommentTool::Rectangle);
     assert_eq!((st.color, st.opacity, st.width), ([0.0, 0.47, 0.84], 0.5, 5.0));
+    // The default survives a restart (#340): a fresh app reads the persisted settings and its
+    // next rectangle still takes the style.
+    let json = h.state().persist();
+    let mut fresh = PdfCraftApp::new();
+    fresh.restore(&json);
+    let st = fresh.comment_prefs.style(pdfcraft_ui_egui::comments::CommentTool::Rectangle);
+    assert_eq!((st.color, st.opacity, st.width), ([0.0, 0.47, 0.84], 0.5, 5.0), "the tool default persisted");
     // The next rectangle takes it.
     h.state_mut().set_option("quick", "square").unwrap();
     drag_pt(&mut h, (160.0, 100.0), (260.0, 40.0));
